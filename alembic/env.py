@@ -7,7 +7,9 @@ from sieve.config import get_settings
 from sieve.core.models import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# Callers (e.g. the test suite) may preset the URL; otherwise use SIEVE_DATABASE_URL.
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", get_settings().database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

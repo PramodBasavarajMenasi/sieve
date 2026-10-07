@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests">
+  <testsuite name="pytest" errors="1" failures="1" skipped="2" tests="7" time="0.412" timestamp="2026-10-07T10:12:03.123456+00:00" hostname="runner-1">
+    <testcase classname="tests.test_math" name="test_add" time="0.001" />
+    <testcase classname="tests.test_math" name="test_add_params[1-2-3]" time="0.001" />
+    <testcase classname="tests.test_math" name="test_add_params[-1-1-0]" time="0.001" />
+    <testcase classname="tests.test_math.TestDivide" name="test_divide_by_zero" time="0.123">
+      <failure message="assert 1 == 2">def test_divide_by_zero(self):
+&gt;       assert 1 == 2
+E       assert 1 == 2
+
+tests/test_math.py:18: AssertionError</failure>
+    </testcase>
+    <testcase classname="tests.test_io" name="test_needs_network" time="0.000">
+      <skipped type="pytest.skip" message="needs network">tests/test_io.py:12: needs network</skipped>
+    </testcase>
+    <testcase classname="tests.test_io" name="test_known_bug" time="0.004">
+      <skipped type="pytest.xfail" message="tracked in #42" />
+    </testcase>
+    <testcase classname="tests.test_io" name="test_fixture_error" time="0.000">
+      <error message="failed on setup with &quot;RuntimeError: db unavailable&quot;">@pytest.fixture
+    def db():
+&gt;       raise RuntimeError("db unavailable")
+E       RuntimeError: db unavailable
+
+tests/conftest.py:7: RuntimeError</error>
+    </testcase>
+  </testsuite>
+</testsuites>

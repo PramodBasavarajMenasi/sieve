@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="5" failures="1" errors="0" time="1.832">
+  <testsuite name="cart" errors="0" failures="1" skipped="1" timestamp="2026-10-07T10:12:03" time="1.203" tests="3">
+    <testcase classname="cart adds an item" name="cart adds an item" time="0.004">
+    </testcase>
+    <testcase classname="cart totals › applies discount" name="cart totals › applies discount" time="0.012">
+      <failure>Error: expect(received).toBe(expected) // Object.is equality
+
+Expected: 30
+Received: 25
+    at Object.toBe (/home/runner/work/shop/shop/src/cart.test.js:21:28)</failure>
+    </testcase>
+    <testcase classname="cart persists to storage" name="cart persists to storage" time="0">
+      <skipped/>
+    </testcase>
+  </testsuite>
+  <testsuite name="formatPrice" errors="0" failures="0" skipped="0" timestamp="2026-10-07T10:12:04" time="0.629" tests="2">
+    <testcase classname="formatPrice formats USD" name="formatPrice formats USD" time="0.002">
+    </testcase>
+    <testcase classname="formatPrice formats   EUR" name="formatPrice formats   EUR" time="0.001">
+    </testcase>
+  </testsuite>
+</testsuites>

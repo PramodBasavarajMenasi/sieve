@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="5" failures="2" skipped="1">
+	<testsuite name="github.com/acme/shop/cart" tests="3" failures="2" errors="0" id="0" hostname="runner-1" skipped="0" time="0.012" timestamp="2026-10-07T10:12:03Z">
+		<properties>
+			<property name="go.version" value="go1.23.2 linux/amd64"></property>
+		</properties>
+		<testcase name="TestAddItem" classname="github.com/acme/shop/cart" time="0.000"></testcase>
+		<testcase name="TestTotal" classname="github.com/acme/shop/cart" time="0.010">
+			<failure message="Failed" type="">    cart_test.go:42: expected 30, got 25</failure>
+		</testcase>
+		<testcase name="TestTotal/with_discount" classname="github.com/acme/shop/cart" time="0.002">
+			<failure message="Failed" type="">    cart_test.go:51: expected 27, got 25</failure>
+		</testcase>
+	</testsuite>
+	<testsuite name="github.com/acme/shop/payment" tests="2" failures="0" errors="0" id="1" hostname="runner-1" skipped="1" time="1.501" timestamp="2026-10-07T10:12:03Z">
+		<testcase name="TestCharge" classname="github.com/acme/shop/payment" time="1.500"></testcase>
+		<testcase name="TestRefund" classname="github.com/acme/shop/payment" time="0.000">
+			<skipped message="    refund_test.go:10: flaky upstream sandbox"></skipped>
+		</testcase>
+	</testsuite>
+</testsuites>

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report-3.0.xsd" version="3.0" name="com.acme.shop.CartServiceTest" time="1,234.567" tests="6" errors="1" skipped="1" failures="2">
+  <properties>
+    <property name="java.version" value="21.0.4"/>
+    <property name="surefire.rerunFailingTestsCount" value="2"/>
+  </properties>
+  <testcase name="addsItem" classname="com.acme.shop.CartServiceTest" time="0.012"/>
+  <testcase name="computesTotal" classname="com.acme.shop.CartServiceTest" time="0.034">
+    <failure message="expected: &lt;30&gt; but was: &lt;25&gt;" type="org.opentest4j.AssertionFailedError"><![CDATA[org.opentest4j.AssertionFailedError: expected: <30> but was: <25>
+	at com.acme.shop.CartServiceTest.computesTotal(CartServiceTest.java:42)
+]]></failure>
+    <rerunFailure message="expected: &lt;30&gt; but was: &lt;26&gt;" type="org.opentest4j.AssertionFailedError">
+      <stackTrace><![CDATA[org.opentest4j.AssertionFailedError: expected: <30> but was: <26>]]></stackTrace>
+    </rerunFailure>
+    <rerunFailure message="expected: &lt;30&gt; but was: &lt;25&gt;" type="org.opentest4j.AssertionFailedError">
+      <stackTrace><![CDATA[org.opentest4j.AssertionFailedError: expected: <30> but was: <25>]]></stackTrace>
+    </rerunFailure>
+  </testcase>
+  <testcase name="loadsPrices" classname="com.acme.shop.CartServiceTest" time="1,200.001">
+    <error message="Connection refused" type="java.net.ConnectException"><![CDATA[java.net.ConnectException: Connection refused
+	at com.acme.shop.PriceClient.load(PriceClient.java:17)
+]]></error>
+    <system-out><![CDATA[GET http://prices.internal/v1/prices]]></system-out>
+  </testcase>
+  <testcase name="appliesCoupon" classname="com.acme.shop.CartServiceTest" time="0">
+    <skipped message="disabled until COUPON-12"/>
+  </testcase>
+  <testcase name="checksStock" classname="com.acme.shop.CartServiceTest" time="0.051">
+    <flakyFailure message="Timed out after 50ms" type="java.util.concurrent.TimeoutException">
+      <stackTrace><![CDATA[java.util.concurrent.TimeoutException: Timed out after 50ms]]></stackTrace>
+      <system-out><![CDATA[retrying stock lookup]]></system-out>
+    </flakyFailure>
+  </testcase>
+  <testcase name="reservesStock" classname="com.acme.shop.CartServiceTest" time="0.020">
+    <flakyError message="Socket closed" type="java.net.SocketException">
+      <stackTrace><![CDATA[java.net.SocketException: Socket closed]]></stackTrace>
+    </flakyError>
+    <flakyFailure message="expected: &lt;true&gt; but was: &lt;false&gt;" type="org.opentest4j.AssertionFailedError">
+      <stackTrace><![CDATA[org.opentest4j.AssertionFailedError]]></stackTrace>
+    </flakyFailure>
+  </testcase>
+</testsuite>

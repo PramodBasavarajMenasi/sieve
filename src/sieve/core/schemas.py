@@ -5,7 +5,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
-from sieve.core.junit import normalize_path
+from sieve.core.junit import Status, normalize_path
 
 NonEmpty255 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 
@@ -51,3 +51,41 @@ class RunResponse(BaseModel):
     repo: str
     created: bool
     counts: StatusCounts
+
+
+class TestStatsOut(BaseModel):
+    __test__ = False  # not a pytest test class
+    model_config = ConfigDict(from_attributes=True)
+
+    runs: int
+    failures: int
+    last_failed_at: datetime | None
+    flaky_score: float
+    avg_duration_ms: float | None
+    broken_on_main_since_sha: str | None
+
+
+class TestResultOut(BaseModel):
+    __test__ = False
+
+    run_id: int
+    commit_sha: str
+    branch: str
+    is_main: bool
+    ci_run_id: str | None
+    run_attempt: int
+    occurred_at: datetime
+    status: Status
+    attempt: int
+    duration_ms: int | None
+    file_path: str | None
+    message: str | None
+
+
+class TestHistoryResponse(BaseModel):
+    __test__ = False
+
+    repo: str
+    test_id: str
+    stats: TestStatsOut
+    results: list[TestResultOut] = Field(description="Latest result rows, newest run first")

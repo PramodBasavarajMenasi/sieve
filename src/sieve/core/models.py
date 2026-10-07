@@ -23,7 +23,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.engine import Dialect
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, column_property, mapped_column
 
 from sieve.core.junit import Status
 
@@ -99,6 +99,10 @@ class Run(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    # When the run happened. Use this (never created_at alone) wherever "latest" matters:
+    # backfill ingests old runs late, so created_at is ingest time, not run time.
+    occurred_at: Mapped[datetime] = column_property(func.coalesce(started_at, created_at))
+
 
 class ChangedFile(Base):
     __tablename__ = "changed_files"
@@ -143,3 +147,4 @@ class TestStats(Base):
     last_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     flaky_score: Mapped[float] = mapped_column(Float, server_default="0")
     broken_on_main_since_sha: Mapped[str | None] = mapped_column(String(64))
+    avg_duration_ms: Mapped[float | None] = mapped_column(Float)

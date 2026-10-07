@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from sieve.core.history import recompute_test_stats
 from sieve.core.junit import ParsedTestResult
 from sieve.core.models import ChangedFile, Repo, Run, TestResult
 from sieve.core.schemas import RunMetadata, StatusCounts
@@ -33,7 +34,8 @@ def find_existing_run(session: Session, meta: RunMetadata) -> Run | None:
 def create_run(
     session: Session, meta: RunMetadata, results: Iterable[ParsedTestResult]
 ) -> tuple[Run, bool]:
-    """Insert the run, its changed files and results in one transaction.
+    """Insert the run, its changed files and results, and roll up ``test_stats`` for the
+    run's tests, all in one transaction.
 
     Returns ``(run, created)``. If a concurrent upload of the same CI run attempt wins the
     race, this transaction is rolled back and the winner's run is returned with
@@ -71,6 +73,8 @@ def create_run(
         ]
         if rows:
             session.execute(insert(TestResult), rows)
+        # Same transaction: stats never reflect a run that failed to commit, or vice versa.
+        recompute_test_stats(session, repo_id, run.id)
         session.commit()
     except IntegrityError as exc:
         session.rollback()

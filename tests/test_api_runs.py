@@ -255,6 +255,83 @@ def test_concurrent_reupload_with_different_commit_returns_409(
     assert count(db_session, Run) == 1
 
 
+# --- changed_files_known ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [({}, True), ({"changed_files_known": True}, True), ({"changed_files_known": False}, False)],
+    ids=["default", "true", "false"],
+)
+def test_changed_files_known_is_stored(
+    client: TestClient, db_session: Session, overrides: dict[str, Any], expected: bool
+) -> None:
+    response = post_run(client, [fixture("go.xml")], metadata(**overrides))
+
+    run = db_session.get(Run, response.json()["run_id"])
+    assert run is not None
+    assert run.changed_files_known is expected
+
+
+# --- GET /runs/lookup ---------------------------------------------------------------------
+
+
+def lookup(client: TestClient, **params: Any) -> httpx.Response:
+    response: httpx.Response = client.get(
+        "/runs/lookup",
+        params={"repo": "acme/shop", "ci_run_id": "9001", **params},
+        headers=AUTH,
+    )
+    return response
+
+
+def test_lookup_finds_ingested_run(client: TestClient) -> None:
+    run_id = post_run(client, [fixture("go.xml")], metadata(run_attempt=2)).json()["run_id"]
+
+    response = lookup(client, run_attempt=2)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "run_id": run_id,
+        "repo": "acme/shop",
+        "ci_run_id": "9001",
+        "run_attempt": 2,
+        "commit_sha": SHA,
+    }
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"ci_run_id": "9999"},
+        {"run_attempt": 3},
+        {"repo": "acme/other"},
+        {},  # run_attempt defaults to 1; only attempt 2 was ingested
+    ],
+    ids=["other-run", "other-attempt", "other-repo", "default-attempt"],
+)
+def test_lookup_returns_404_when_not_ingested(client: TestClient, params: dict[str, Any]) -> None:
+    post_run(client, [fixture("go.xml")], metadata(run_attempt=2))
+
+    response = lookup(client, **params)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{"repo": ""}, {"ci_run_id": ""}, {"run_attempt": 0}],
+    ids=["empty-repo", "empty-ci-run-id", "attempt-0"],
+)
+def test_lookup_validates_params(client: TestClient, params: dict[str, Any]) -> None:
+    assert lookup(client, **params).status_code == 422
+
+
+def test_lookup_requires_token(client: TestClient) -> None:
+    response = client.get("/runs/lookup", params={"repo": "acme/shop", "ci_run_id": "1"})
+    assert response.status_code == 401
+
+
 # --- auth ---------------------------------------------------------------------------------
 
 

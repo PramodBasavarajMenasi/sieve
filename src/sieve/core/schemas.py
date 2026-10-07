@@ -27,6 +27,11 @@ class RunMetadata(BaseModel):
     run_attempt: int = Field(default=1, ge=1)
     started_at: datetime | None = None
     changed_files: list[str] = Field(default_factory=list)
+    changed_files_known: bool = Field(
+        default=True,
+        description="False if the uploader could not determine the diff; forces full-suite "
+        "selection for this run.",
+    )
 
     @field_validator("changed_files")
     @classmethod
@@ -51,6 +56,14 @@ class RunResponse(BaseModel):
     repo: str
     created: bool
     counts: StatusCounts
+
+
+class RunLookupResponse(BaseModel):
+    run_id: int
+    repo: str
+    ci_run_id: str
+    run_attempt: int
+    commit_sha: str
 
 
 class TestStatsOut(BaseModel):

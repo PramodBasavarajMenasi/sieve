@@ -21,6 +21,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     func,
+    true,
 )
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, column_property, mapped_column
@@ -98,6 +99,9 @@ class Run(Base):
     run_attempt: Mapped[int] = mapped_column(Integer, server_default="1")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # False when the uploader could not determine the diff (so changed_files is incomplete or
+    # empty). Selection must then fall back to the full suite.
+    changed_files_known: Mapped[bool] = mapped_column(Boolean, server_default=true())
 
     # When the run happened. Use this (never created_at alone) wherever "latest" matters:
     # backfill ingests old runs late, so created_at is ingest time, not run time.

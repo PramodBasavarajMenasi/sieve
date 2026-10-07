@@ -16,19 +16,20 @@ from sieve.core.schemas import RunMetadata, StatusCounts
 RUN_UNIQUE_CONSTRAINT = "uq_runs_repo_id_ci_run_id_run_attempt"
 
 
-def find_existing_run(session: Session, meta: RunMetadata) -> Run | None:
-    """The run already stored for this CI run attempt, if any. Runs without a CI id never match."""
-    if meta.ci_run_id is None:
-        return None
+def find_run(session: Session, repo: str, ci_run_id: str, run_attempt: int) -> Run | None:
+    """The run stored for this CI run attempt, if any."""
     return session.scalars(
         select(Run)
         .join(Repo, Run.repo_id == Repo.id)
-        .where(
-            Repo.name == meta.repo,
-            Run.ci_run_id == meta.ci_run_id,
-            Run.run_attempt == meta.run_attempt,
-        )
+        .where(Repo.name == repo, Run.ci_run_id == ci_run_id, Run.run_attempt == run_attempt)
     ).one_or_none()
+
+
+def find_existing_run(session: Session, meta: RunMetadata) -> Run | None:
+    """The run already stored for this upload, if any. Runs without a CI id never match."""
+    if meta.ci_run_id is None:
+        return None
+    return find_run(session, meta.repo, meta.ci_run_id, meta.run_attempt)
 
 
 def create_run(
@@ -51,6 +52,7 @@ def create_run(
             ci_run_id=meta.ci_run_id,
             run_attempt=meta.run_attempt,
             started_at=meta.started_at,
+            changed_files_known=meta.changed_files_known,
         )
         session.add(run)
         session.flush()

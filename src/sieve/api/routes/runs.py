@@ -1,20 +1,56 @@
-"""POST /runs: ingest a CI run's JUnit XML."""
+"""POST /runs: ingest a CI run's JUnit XML. GET /runs/lookup: check whether one is stored."""
 
 from collections import Counter
 from dataclasses import replace
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
-from sieve.core.ingest import count_results, create_run, find_existing_run
+from sieve.core.ingest import count_results, create_run, find_existing_run, find_run
 from sieve.core.junit import JUnitParseError, ParsedTestResult, parse_junit
-from sieve.core.schemas import RunMetadata, RunResponse
+from sieve.core.schemas import RunLookupResponse, RunMetadata, RunResponse
 from sieve.db import get_session
 
 # Auth is enforced by BearerAuthMiddleware, before the request body is read.
 router = APIRouter()
+
+
+@router.get(
+    "/runs/lookup",
+    responses={404: {"description": "No run recorded for this CI run attempt"}},
+)
+def lookup_run(
+    session: Annotated[Session, Depends(get_session)],
+    repo: Annotated[str, Query(min_length=1)],
+    ci_run_id: Annotated[str, Query(min_length=1)],
+    run_attempt: Annotated[int, Query(ge=1)] = 1,
+) -> RunLookupResponse:
+    """Whether a CI run attempt is already ingested, so uploaders can skip the work."""
+    run = find_run(session, repo, ci_run_id, run_attempt)
+    if run is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no run {ci_run_id} attempt {run_attempt} recorded for {repo!r}",
+        )
+    return RunLookupResponse(
+        run_id=run.id,
+        repo=repo,
+        ci_run_id=ci_run_id,
+        run_attempt=run_attempt,
+        commit_sha=run.commit_sha,
+    )
 
 
 @router.post(

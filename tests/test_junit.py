@@ -178,6 +178,88 @@ def test_maven_flaky_attempts_precede_final_pass() -> None:
     ]
 
 
+# --- Go, package attribute (ipfs/kubo format) ---------------------------------------------
+
+CLI = "github.com/ipfs/kubo/test/cli"
+COREUNIX = "github.com/ipfs/kubo/core/coreunix"
+
+
+def test_go_package_attribute_fixture() -> None:
+    results = load("go-package-attr.xml")
+
+    assert [(r.test_id, r.status, r.attempt) for r in results] == [
+        (f"{CLI}::TestAdd", Status.PASSED, 1),
+        (f"{CLI}::TestAdd/produced_cid_version:_implicit_default_(CIDv0)", Status.PASSED, 1),
+        (f"{CLI}::TestAdd/ipfs_add_--to-files", Status.SKIPPED, 1),
+        (f"{COREUNIX}::TestAdd", Status.FAILED, 1),
+        (f"{COREUNIX}::TestAdd/ipfs_add_--to-files", Status.PASSED, 1),
+    ]
+    assert all(r.classname in (CLI, COREUNIX) for r in results)
+
+    failed = only(results, f"{COREUNIX}::TestAdd")
+    assert failed.message == "Failed"
+    assert failed.duration_ms == 380
+    assert only(results, f"{CLI}::TestAdd/ipfs_add_--to-files").message == "SKIP"
+
+
+def test_same_named_tests_in_different_packages_get_different_ids() -> None:
+    results = load("go-package-attr.xml")
+
+    # Both packages define TestAdd and TestAdd/ipfs_add_--to-files. Keyed by suite name they
+    # would share an ID, and the second would be miscounted as a retry (attempt 2).
+    for name in ("TestAdd", "TestAdd/ipfs_add_--to-files"):
+        ids = {r.test_id for r in results if r.name == name}
+        assert ids == {f"{CLI}::{name}", f"{COREUNIX}::{name}"}
+    assert len({r.test_id for r in results}) == len(results)
+    assert all(r.attempt == 1 for r in results)
+
+
+def test_classname_package_and_suite_name_precedence() -> None:
+    xml = """
+    <testsuites>
+      <testsuite name="Outer" package="example.com/outer">
+        <testcase classname="explicit.Class" name="has_classname"/>
+        <testcase name="uses_package"/>
+        <testsuite name="Inner">
+          <testcase name="inherits_outer_package"/>
+        </testsuite>
+        <testsuite name="Other" package="example.com/other">
+          <testcase name="uses_own_package"/>
+        </testsuite>
+      </testsuite>
+      <testsuite name="NoPackage">
+        <testcase name="uses_suite_name"/>
+      </testsuite>
+    </testsuites>
+    """
+    assert [r.test_id for r in parse_junit(xml)] == [
+        "explicit.Class::has_classname",
+        "example.com/outer::uses_package",
+        "example.com/outer::inherits_outer_package",
+        "example.com/other::uses_own_package",
+        "NoPackage::uses_suite_name",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("root_attrs", "expected_id"),
+    [
+        ('name="com.acme.FooTest"', "com.acme.FooTest::bar"),
+        ('name="TestFoo" package="example.com/pkg"', "example.com/pkg::bar"),
+    ],
+    ids=["suite-name", "package"],
+)
+def test_bare_testsuite_root_attributes_apply_to_its_testcases(
+    root_attrs: str, expected_id: str
+) -> None:
+    # Regression: the root <testsuite>'s own attributes were ignored, giving "::bar".
+    [result] = parse_junit(
+        f'<testsuite {root_attrs} file="src/foo.go"><testcase name="bar"/></testsuite>'
+    )
+    assert result.test_id == expected_id
+    assert result.file_path == "src/foo.go"
+
+
 # --- dialect edge cases -------------------------------------------------------------------
 
 

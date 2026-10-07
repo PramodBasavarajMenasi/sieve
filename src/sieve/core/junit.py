@@ -5,7 +5,9 @@ Gradle. All of them share the ``<testsuites>/<testsuite>/<testcase>`` shape; the
 handled here are:
 
 * root may be ``<testsuites>`` or a bare ``<testsuite>``, and suites may be nested;
-* ``classname`` may be missing (falls back to the enclosing suite name);
+* ``classname`` may be missing: it falls back to the enclosing suite's ``package`` attribute
+  (Go reporters that name suites after the top-level test, e.g. ipfs/kubo's CI), then to the
+  suite's ``name``;
 * ``file`` may live on the testcase, the suite, or nowhere;
 * Surefire reruns are recorded as ``<flakyFailure>``/``<flakyError>`` (failed, then passed)
   and ``<rerunFailure>``/``<rerunError>`` (failed every time) children;
@@ -66,7 +68,18 @@ def parse_junit(data: bytes | str) -> list[ParsedTestResult]:
 
     results: list[ParsedTestResult] = []
     attempts: Counter[str] = Counter()
-    _walk(root, suite_name="", suite_file=None, results=results, attempts=attempts)
+    # A bare <testsuite> root is itself a suite: its attributes apply to its testcases.
+    is_suite = tag == "testsuite"
+    _walk(
+        root,
+        suite=_Suite(
+            name=(root.get("name") or "") if is_suite else "",
+            package=(root.get("package") or "") if is_suite else "",
+            file=root.get("file") if is_suite else None,
+        ),
+        results=results,
+        attempts=attempts,
+    )
     return results
 
 
@@ -75,41 +88,49 @@ def make_test_id(classname: str, name: str) -> str:
     return f"{_normalize(classname)}::{_normalize(name)}"
 
 
+@dataclass(frozen=True, slots=True)
+class _Suite:
+    """Attributes inherited from the enclosing (possibly nested) <testsuite> elements."""
+
+    name: str
+    package: str
+    file: str | None
+
+
 def _walk(
     elem: Element,
     *,
-    suite_name: str,
-    suite_file: str | None,
+    suite: _Suite,
     results: list[ParsedTestResult],
     attempts: Counter[str],
 ) -> None:
     for child in elem:
         tag = _local(child.tag)
         if tag in ("testsuite", "testsuites"):
-            _walk(
-                child,
-                suite_name=child.get("name") or suite_name,
-                suite_file=child.get("file") or suite_file,
-                results=results,
-                attempts=attempts,
+            nested = _Suite(
+                name=child.get("name") or suite.name,
+                package=child.get("package") or suite.package,
+                file=child.get("file") or suite.file,
             )
+            _walk(child, suite=nested, results=results, attempts=attempts)
         elif tag == "testcase":
-            _parse_testcase(child, suite_name, suite_file, results, attempts)
+            _parse_testcase(child, suite, results, attempts)
 
 
 def _parse_testcase(
     case: Element,
-    suite_name: str,
-    suite_file: str | None,
+    suite: _Suite,
     results: list[ParsedTestResult],
     attempts: Counter[str],
 ) -> None:
     name = _normalize(case.get("name") or "")
     if not name:
         raise JUnitParseError("<testcase> without a name attribute")
-    classname = _normalize(case.get("classname") or suite_name)
+    # Without a classname, prefer the suite's package over its name: some Go reporters name
+    # each suite after the top-level test, so the name alone collides across packages.
+    classname = _normalize(case.get("classname") or suite.package or suite.name)
     test_id = make_test_id(classname, name)
-    file_path = normalize_path(case.get("file") or suite_file)
+    file_path = normalize_path(case.get("file") or suite.file)
     duration_ms = _parse_duration(case.get("time"))
 
     def emit(status: Status, message: str | None, duration: int | None) -> None:

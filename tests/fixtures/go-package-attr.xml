@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shape of ipfs/kubo's gotest.yml JUnit artifacts: one <testsuite> per top-level test, named
+     after the test, with the Go package in a `package` attribute and no testcase classname.
+     Two packages here both define TestAdd. -->
+<testsuites>
+   <testsuite package="github.com/ipfs/kubo/test/cli"
+               name="TestAdd"
+               tests="3"
+               failures="0"
+               skipped="1"
+               time="12.75"
+               timestamp="2026-10-01T21:38:10.148700145Z">
+      <testcase name="TestAdd" time="0" timestamp="2026-10-01T21:38:10.148700145Z">
+         <system-out>=== RUN   TestAdd
+=== PAUSE TestAdd
+=== CONT  TestAdd
+--- PASS: TestAdd (0.00s)
+</system-out>
+      </testcase>
+      <testcase name="TestAdd/produced_cid_version:_implicit_default_(CIDv0)" time="0.53" timestamp="2026-10-01T21:38:10.150000000Z">
+         <system-out>=== RUN   TestAdd/produced_cid_version:_implicit_default_(CIDv0)
+--- PASS: TestAdd/produced_cid_version:_implicit_default_(CIDv0) (0.53s)
+</system-out>
+      </testcase>
+      <testcase name="TestAdd/ipfs_add_--to-files" time="0" timestamp="2026-10-01T21:38:10.700000000Z">
+         <skipped message="SKIP"></skipped>
+         <system-out>=== RUN   TestAdd/ipfs_add_--to-files
+    add_test.go:211: requires a running daemon
+--- SKIP: TestAdd/ipfs_add_--to-files (0.00s)
+</system-out>
+      </testcase>
+   </testsuite>
+   <testsuite package="github.com/ipfs/kubo/core/coreunix"
+               name="TestAdd"
+               tests="2"
+               failures="1"
+               skipped="0"
+               time="0.41"
+               timestamp="2026-10-01T21:38:02.002000000Z">
+      <testcase name="TestAdd" time="0.38" timestamp="2026-10-01T21:38:02.002000000Z">
+         <failure message="Failed">    add_test.go:47: expected 3 links, got 2
+--- FAIL: TestAdd (0.38s)</failure>
+      </testcase>
+      <testcase name="TestAdd/ipfs_add_--to-files" time="0.03" timestamp="2026-10-01T21:38:02.390000000Z">
+         <system-out>=== RUN   TestAdd/ipfs_add_--to-files
+--- PASS: TestAdd/ipfs_add_--to-files (0.03s)
+</system-out>
+      </testcase>
+   </testsuite>
+</testsuites>

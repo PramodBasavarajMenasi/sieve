@@ -10,6 +10,7 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://sieve:sieve@localhost:5432/sieve"
     api_token: str | None = None
+    max_upload_bytes: int = 50 * 1024 * 1024
 
 
 @lru_cache

@@ -38,14 +38,20 @@ NAMING_CONVENTION = {
 
 
 MESSAGE_MAX_BYTES = 4096
+TRUNCATION_MARKER = "…[truncated]"
 
 
 def truncate_utf8(value: str, max_bytes: int) -> str:
-    """Cut ``value`` to at most ``max_bytes`` of UTF-8 without splitting a character."""
+    """Fit ``value`` into ``max_bytes`` of UTF-8, ending with ``TRUNCATION_MARKER`` if cut.
+
+    Never splits a multi-byte character.
+    """
     encoded = value.encode("utf-8")
     if len(encoded) <= max_bytes:
         return value
-    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+    marker = TRUNCATION_MARKER.encode("utf-8")
+    head = encoded[: max(max_bytes - len(marker), 0)].decode("utf-8", errors="ignore")
+    return head + TRUNCATION_MARKER
 
 
 class TruncatedText(TypeDecorator[str]):

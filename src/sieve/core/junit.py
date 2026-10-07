@@ -109,7 +109,7 @@ def _parse_testcase(
         raise JUnitParseError("<testcase> without a name attribute")
     classname = _normalize(case.get("classname") or suite_name)
     test_id = make_test_id(classname, name)
-    file_path = _normalize_path(case.get("file") or suite_file)
+    file_path = normalize_path(case.get("file") or suite_file)
     duration_ms = _parse_duration(case.get("time"))
 
     def emit(status: Status, message: str | None, duration: int | None) -> None:
@@ -160,7 +160,7 @@ def _normalize(value: str) -> str:
     return " ".join(value.split())
 
 
-def _normalize_path(path: str | None) -> str | None:
+def normalize_path(path: str | None) -> str | None:
     if not path:
         return None
     path = path.strip().replace("\\", "/")

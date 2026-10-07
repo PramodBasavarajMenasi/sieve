@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from sieve.core.junit import Status
 from sieve.core.models import (
     MESSAGE_MAX_BYTES,
+    TRUNCATION_MARKER,
     Base,
     ChangedFile,
     Repo,
@@ -111,16 +112,18 @@ def test_ci_run_attempt_is_unique_per_repo(db_session: Session) -> None:
 @pytest.mark.parametrize(
     ("value", "max_bytes", "expected"),
     [
-        ("short", 10, "short"),
-        ("exactly10!", 10, "exactly10!"),
-        ("abcdefghijk", 10, "abcdefghij"),
+        # TRUNCATION_MARKER is 14 bytes, leaving 6 for content when max_bytes=20.
+        ("short", 20, "short"),
+        ("a" * 20, 20, "a" * 20),
+        ("a" * 21, 20, "aaaaaa" + TRUNCATION_MARKER),
         # "é" is 2 bytes; a cut through its middle drops the partial character.
-        ("aaaaaaaaaé", 10, "aaaaaaaaa"),
-        ("aaaaaaaé", 9, "aaaaaaaé"),
+        ("a" + "é" * 10, 20, "aéé" + TRUNCATION_MARKER),
     ],
 )
 def test_truncate_utf8(value: str, max_bytes: int, expected: str) -> None:
-    assert truncate_utf8(value, max_bytes) == expected
+    truncated = truncate_utf8(value, max_bytes)
+    assert truncated == expected
+    assert len(truncated.encode()) <= max_bytes
 
 
 def test_message_is_truncated_on_orm_and_bulk_insert(db_session: Session) -> None:
@@ -150,7 +153,8 @@ def test_message_is_truncated_on_orm_and_bulk_insert(db_session: Session) -> Non
         message = stored[test_id]
         assert message is not None
         assert len(message.encode()) <= MESSAGE_MAX_BYTES
-        assert message == "€" * (MESSAGE_MAX_BYTES // 3)
+        budget = MESSAGE_MAX_BYTES - len(TRUNCATION_MARKER.encode())
+        assert message == "€" * (budget // 3) + TRUNCATION_MARKER
     assert stored["t::none"] is None
 
 

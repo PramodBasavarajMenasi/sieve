@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from sieve import __version__
 from sieve.api.auth import BearerAuthMiddleware
 from sieve.api.limits import BodySizeLimitMiddleware
-from sieve.api.routes import history, runs
+from sieve.api.routes import history, runs, select
 from sieve.config import Settings, get_settings
 
 
@@ -17,6 +17,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(BearerAuthMiddleware, token=settings.api_token)
     app.include_router(runs.router)
     app.include_router(history.router)
+    app.include_router(select.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

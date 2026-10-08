@@ -69,6 +69,9 @@ FULL_SUITE_COMMANDS: dict[Runner, str] = {
     Runner.JEST: "jest",
 }
 
+# Reason for a selective result with nothing to run (e.g. a docs-only change).
+NO_TESTS_AFFECTED = "no tests affected"
+
 JS_EXTENSIONS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"})
 
 # Changing any of these can affect every test: dependencies, build, CI, test configuration.
@@ -269,7 +272,9 @@ def select_tests(
 
     return Selection(
         mode=Mode.SELECTIVE,
-        reason=f"{len(chosen)} of {len(tests)} known tests selected",
+        reason=(
+            f"{len(chosen)} of {len(tests)} known tests selected" if chosen else NO_TESTS_AFFECTED
+        ),
         tests=tuple(
             SelectedTest(t.test_id, tuple(selected[t.test_id]), t.runner, t.file_path)
             for t in chosen

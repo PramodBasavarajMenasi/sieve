@@ -66,6 +66,40 @@ class RunLookupResponse(BaseModel):
     commit_sha: str
 
 
+class SelectRequest(BaseModel):
+    """Body of ``POST /select``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repo: NonEmpty255
+    changed_files: list[Annotated[str, StringConstraints(max_length=4096)]] = Field(
+        default_factory=list, max_length=50_000
+    )
+    changed_files_known: bool = Field(
+        default=True,
+        description="False if the caller could not determine the diff; forces the full suite.",
+    )
+
+
+class SelectedTestOut(BaseModel):
+    test_id: str
+    reasons: list[str]
+    reason: str = Field(description="All reasons, joined with '; '")
+    runner: str | None
+    file_path: str | None
+
+
+class SelectResponse(BaseModel):
+    repo: str
+    mode: str = Field(description="'full' or 'selective'")
+    reason: str
+    selected_count: int
+    total_known: int
+    command: str = Field(description="Shell line to run; empty when no tests are affected")
+    commands: list[str]
+    tests: list[SelectedTestOut] = Field(description="Selected tests; empty in full mode")
+
+
 class TestStatsOut(BaseModel):
     __test__ = False  # not a pytest test class
     model_config = ConfigDict(from_attributes=True)

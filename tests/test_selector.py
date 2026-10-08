@@ -309,7 +309,7 @@ def test_documentation_changes_are_ignored() -> None:
     assert selection.tests == ()
     assert selection.commands == ()
     assert selection.command == ""
-    assert selection.reason == "0 of 6 known tests selected"
+    assert selection.reason == "no tests affected"
 
 
 def test_co_change_selects_tests_that_failed_with_these_files() -> None:

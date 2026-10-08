@@ -19,7 +19,8 @@ Otherwise it selects the union of these signals, and every test carries its reas
   - Python: ``src/x/foo.py`` selects tests in any ``test_foo.py`` / ``foo_test.py``. Test file
     paths come from ``file_path``, or are derived from the pytest classname
     (``tests.test_foo.TestBar`` -> ``tests/test_foo.py``).
-  - Go: a changed ``.go`` file selects every test in the same package directory. Packages are
+  - Go: a changed ``.go`` file selects every test in the same package directory, and that
+    package runs whole (no ``-run``), so tests added in the change run too. Packages are
     matched by import-path suffix (``test/cli`` matches ``github.com/ipfs/kubo/test/cli``), or
     exactly when ``SelectorConfig.go_module`` is set.
   - JS/TS: ``foo.ts`` selects ``foo.test.*``, ``foo.spec.*`` and ``__tests__/foo.*``.
@@ -41,7 +42,7 @@ import fnmatch
 import posixpath
 import re
 import shlex
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -172,6 +173,9 @@ class Selection:
     selected_count: int
     total_known: int
     commands: tuple[str, ...]
+    # Go packages with changed .go files. Their command has no -run filter, so tests added in
+    # the same change (not yet in history) run too.
+    go_packages_run_whole: tuple[str, ...] = ()
 
     @property
     def command(self) -> str:
@@ -223,12 +227,15 @@ def select_tests(
     # Path mapping. Every changed source file must map to at least one test.
     relevant = [p for p in paths if not is_ignorable(p)]
     unmapped = []
+    whole_packages: set[str] = set()
     for path in relevant:
         hits = _map_path(path, tests, config)
         if not hits:
             unmapped.append(path)
         for test_id, reason in hits.items():
             add(test_id, reason)
+            if path.endswith(".go") and tests[test_id].runner is Runner.GO:
+                whole_packages.add(tests[test_id].classname)
     if unmapped:
         return full(f"changed file maps to no known tests: {_list(unmapped)}")
 
@@ -281,7 +288,8 @@ def select_tests(
         ),
         selected_count=len(chosen),
         total_known=len(tests),
-        commands=_build_commands(chosen, config.go_module),
+        commands=_build_commands(chosen, config.go_module, whole_packages),
+        go_packages_run_whole=tuple(sorted(whole_packages)),
     )
 
 
@@ -443,8 +451,17 @@ def _js_test_matches(test_path: str, stem: str) -> bool:
 # --- commands -----------------------------------------------------------------------------
 
 
-def _build_commands(tests: Sequence[_Test], go_module: str | None = None) -> tuple[str, ...]:
-    """One command per runner (per package for Go), in a stable order."""
+def _build_commands(
+    tests: Sequence[_Test],
+    go_module: str | None = None,
+    go_whole_packages: Collection[str] = (),
+) -> tuple[str, ...]:
+    """One command per runner (per package for Go), in a stable order.
+
+    Go packages in ``go_whole_packages`` run without -run, so tests that history doesn't
+    know yet (added in this change) run too. Other Go packages only had tests pulled in by
+    co-change, recently-failed or always-run, so they keep -run for just those tests.
+    """
     commands: list[str] = []
 
     pytest_ids = sorted(
@@ -461,8 +478,12 @@ def _build_commands(tests: Sequence[_Test], go_module: str | None = None) -> tup
         if t.runner is Runner.GO:
             go_tests.setdefault(t.classname, set()).add(t.name.split("/", 1)[0])
     for package in sorted(go_tests):
-        pattern = "^(" + "|".join(sorted(go_tests[package])) + ")$"
-        commands.append(shlex.join(["go", "test", _go_target(package, go_module), "-run", pattern]))
+        target = _go_target(package, go_module)
+        if package in go_whole_packages:
+            commands.append(shlex.join(["go", "test", target]))
+        else:
+            pattern = "^(" + "|".join(sorted(go_tests[package])) + ")$"
+            commands.append(shlex.join(["go", "test", target, "-run", pattern]))
 
     jest_files = sorted({t.file_path for t in tests if t.runner is Runner.JEST and t.file_path})
     if jest_files:

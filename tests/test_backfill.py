@@ -19,6 +19,8 @@ SIEVE = "http://sieve.test"
 REPO = "acme/shop"
 HEAD = "a" * 40
 PARENT = "b" * 40
+BASE = "c" * 40  # a pull request's base
+BEFORE = "d" * 40  # a push's previous branch tip
 FIXTURES = Path(__file__).parent / "fixtures"
 PYTEST_XML = (FIXTURES / "pytest.xml").read_bytes()
 GO_XML = (FIXTURES / "go.xml").read_bytes()
@@ -94,8 +96,17 @@ def mock_download(router: respx.MockRouter, artifact_id: int, archive: bytes) ->
 
 
 def mock_changed_files(router: respx.MockRouter, files: list[dict[str, str]]) -> respx.Route:
+    """First-parent diff: what a push run without a check suite falls back to."""
     router.get(f"{GH}/repos/{REPO}/commits/{HEAD}").respond(json={"parents": [{"sha": PARENT}]})
-    return router.get(f"{GH}/repos/{REPO}/compare/{PARENT}...{HEAD}").respond(json={"files": files})
+    return mock_compare(router, PARENT, files)
+
+
+def mock_compare(router: respx.MockRouter, base: str, files: list[dict[str, str]]) -> respx.Route:
+    return router.get(f"{GH}/repos/{REPO}/compare/{base}...{HEAD}").respond(json={"files": files})
+
+
+def pr(base: str, head: str = HEAD, number: int = 7) -> dict[str, Any]:
+    return {"number": number, "head": {"sha": head}, "base": {"sha": base}}
 
 
 def mock_sieve(router: respx.MockRouter, *statuses: int) -> respx.Route:
@@ -213,11 +224,12 @@ def test_branch_and_pull_request_runs_are_not_main(
     mock_runs(
         router,
         gh_run(1, head_branch="feature"),
-        gh_run(2, head_branch="main", event="pull_request"),  # e.g. a fork's main
+        gh_run(2, head_branch="main", event="pull_request", pull_requests=[pr(BASE)]),  # fork main
     )
     for run_id in (1, 2):
         standard_run(router, gh_run(run_id))
     mock_changed_files(router, [])
+    mock_compare(router, BASE, [])
     sieve = mock_sieve(router, 201, 201)
 
     run_backfill(clock)
@@ -417,6 +429,109 @@ def test_oversized_artifact_is_rejected_before_decompressing() -> None:
 
 
 # --- changed files ------------------------------------------------------------------------
+
+
+def uploaded_diff(sieve: respx.Route) -> tuple[list[str], bool]:
+    metadata = parse_upload(sieve.calls.last.request)[0]
+    return metadata["changed_files"], metadata["changed_files_known"]
+
+
+def test_push_run_diffs_the_whole_push(router: respx.MockRouter, clock: FakeClock) -> None:
+    mock_runs(router, gh_run(1, check_suite_id=55))
+    standard_run(router, gh_run(1))
+    router.get(f"{GH}/repos/{REPO}/check-suites/55").respond(json={"before": BEFORE, "after": HEAD})
+    mock_compare(router, BEFORE, [{"filename": "a.go"}, {"filename": "b.go"}])
+    first_parent = router.get(f"{GH}/repos/{REPO}/commits/{HEAD}").respond(json={})
+    sieve = mock_sieve(router, 201)
+
+    run_backfill(clock)
+
+    assert uploaded_diff(sieve) == (["a.go", "b.go"], True)
+    assert not first_parent.called
+
+
+@pytest.mark.parametrize(
+    "suite_response",
+    [
+        httpx.Response(200, json={"before": "0" * 40}),  # the push created the branch
+        httpx.Response(200, json={"before": None}),
+        httpx.Response(404, json={"message": "Not Found"}),
+    ],
+    ids=["new-branch", "no-before", "suite-lookup-fails"],
+)
+def test_push_run_falls_back_to_first_parent(
+    router: respx.MockRouter, clock: FakeClock, suite_response: httpx.Response
+) -> None:
+    mock_runs(router, gh_run(1, check_suite_id=55))
+    standard_run(router, gh_run(1))
+    router.get(f"{GH}/repos/{REPO}/check-suites/55").mock(return_value=suite_response)
+    mock_changed_files(router, [{"filename": "head_commit_only.go"}])
+    sieve = mock_sieve(router, 201)
+
+    run_backfill(clock)
+
+    assert uploaded_diff(sieve) == (["head_commit_only.go"], True)
+
+
+def test_pull_request_run_diffs_the_whole_pr(router: respx.MockRouter, clock: FakeClock) -> None:
+    # Several PRs can share a branch commit; the one whose head is this run's sha wins.
+    other = pr("e" * 40, head="f" * 40, number=8)
+    mock_runs(router, gh_run(1, event="pull_request", pull_requests=[other, pr(BASE)]))
+    standard_run(router, gh_run(1))
+    mock_compare(router, BASE, [{"filename": "first_commit.go"}, {"filename": "last_commit.go"}])
+    sieve = mock_sieve(router, 201)
+
+    run_backfill(clock)
+
+    assert uploaded_diff(sieve) == (["first_commit.go", "last_commit.go"], True)
+
+
+def test_fork_pull_request_base_is_looked_up(router: respx.MockRouter, clock: FakeClock) -> None:
+    # GitHub leaves pull_requests empty for PRs from forks.
+    mock_runs(router, gh_run(1, event="pull_request", pull_requests=[]))
+    standard_run(router, gh_run(1))
+    pulls = router.get(f"{GH}/repos/{REPO}/commits/{HEAD}/pulls").respond(json=[pr(BASE)])
+    mock_compare(router, BASE, [{"filename": "fork_change.go"}])
+    sieve = mock_sieve(router, 201)
+
+    run_backfill(clock)
+
+    assert pulls.called
+    assert uploaded_diff(sieve) == (["fork_change.go"], True)
+
+
+@pytest.mark.parametrize(
+    "pulls_response",
+    [httpx.Response(200, json=[]), httpx.Response(404, json={"message": "Not Found"})],
+    ids=["no-pr", "lookup-fails"],
+)
+def test_pull_request_without_a_base_is_unknown(
+    router: respx.MockRouter, clock: FakeClock, pulls_response: httpx.Response
+) -> None:
+    mock_runs(router, gh_run(1, event="pull_request", pull_requests=[]))
+    standard_run(router, gh_run(1))
+    router.get(f"{GH}/repos/{REPO}/commits/{HEAD}/pulls").mock(return_value=pulls_response)
+    sieve = mock_sieve(router, 201)
+
+    summary, _ = run_backfill(clock)
+
+    assert counts(summary) == {"new": 1}  # still uploaded, just without a diff
+    assert uploaded_diff(sieve) == ([], False)
+
+
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch", "pull_request_target"])
+def test_other_events_have_unknown_diffs(
+    router: respx.MockRouter, clock: FakeClock, event: str
+) -> None:
+    mock_runs(router, gh_run(1, event=event))
+    standard_run(router, gh_run(1))
+    sieve = mock_sieve(router, 201)
+
+    run_backfill(clock)
+
+    assert uploaded_diff(sieve) == ([], False)
+    compared = [c for c in router.calls if "/compare/" in c.request.url.path]
+    assert compared == []
 
 
 @pytest.mark.parametrize(

@@ -254,6 +254,8 @@ def would_run(selection: Selection, test_id: str) -> bool:
     if test_id in selected:
         return True
     package, _, name = test_id.partition("::")
+    if package in selection.go_packages_run_whole:
+        return True  # `go test ./pkg` with no -run: every test in the package, new ones too
     top_level = name.split("/", 1)[0]
     # go test -run '^(TestX)$' runs TestX with all of its subtests.
     return any(

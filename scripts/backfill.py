@@ -183,25 +183,97 @@ class GitHubClient:
         response.raise_for_status()
         return response.content
 
-    def changed_files(self, repo: str, sha: str) -> tuple[list[str], bool]:
-        """``(paths, known)``: files changed between ``sha``'s first parent and ``sha``.
+    def changed_files(self, repo: str, run: Json) -> tuple[list[str], bool]:
+        """``(paths, known)``: the files this run's change touched.
 
-        ``known`` is False (with no paths) when the diff can't be determined completely:
-        the API failed, the list hit the compare API's file cap, or ``sha`` is a root commit
-        (where every file is new).
+        The range matches what ``sieve select`` diffs for the same change:
+
+        * ``pull_request``: the PR's base sha ... head sha (the whole PR, not just its last
+          commit).
+        * ``push``: the push's ``before`` ... ``after`` (every pushed commit), falling back to
+          the head commit's first parent when there is no usable ``before`` (new branch).
+        * anything else (schedule, workflow_dispatch, pull_request_target, ...): unknown.
+
+        ``known`` is False (with no paths) whenever the range can't be determined or the diff
+        is incomplete.
         """
+        head = run["head_sha"]
+        event = run.get("event")
+        if event == "pull_request":
+            base = self._pull_request_base(repo, run)
+            if base is None:
+                _warn(f"run {run['id']}: no pull request found for {head[:7]}; diff unknown")
+                return [], False
+            return self._compare(repo, base, head)
+        if event == "push":
+            before = self._push_before(repo, run)
+            if before is not None:
+                return self._compare(repo, before, head)
+            return self._first_parent_diff(repo, head)
+        _warn(f"run {run['id']}: no diff range for {event!r} runs; changed files unknown")
+        return [], False
+
+    def _pull_request_base(self, repo: str, run: Json) -> str | None:
+        head = run["head_sha"]
+        candidates: list[Json] = run.get("pull_requests") or []
+        if not candidates:
+            # GitHub leaves pull_requests empty for PRs from forks; ask which PRs have this commit.
+            try:
+                response = self.get(f"/repos/{repo}/commits/{head}/pulls")
+                response.raise_for_status()
+                data = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                _warn(f"could not look up pull requests for {head[:7]}: {exc}")
+                return None
+            candidates = (
+                [pr for pr in data if isinstance(pr, dict)] if isinstance(data, list) else []
+            )
+        matching = [pr for pr in candidates if pr.get("head", {}).get("sha") == head]
+        for pr in matching or candidates:
+            sha = pr.get("base", {}).get("sha")
+            if sha:
+                return str(sha)
+        return None
+
+    def _push_before(self, repo: str, run: Json) -> str | None:
+        """The push's ``before`` sha (from the run's check suite), if it is a usable base."""
+        suite_id = run.get("check_suite_id")
+        if not suite_id:
+            return None
+        try:
+            before = self.get_json(f"/repos/{repo}/check-suites/{suite_id}").get("before")
+        except (httpx.HTTPError, ValueError) as exc:
+            _warn(f"could not get check suite {suite_id}: {exc}")
+            return None
+        # All zeros: the push created the branch, so there is no previous tip.
+        if not before or set(before) == {"0"}:
+            return None
+        return str(before)
+
+    def _first_parent_diff(self, repo: str, sha: str) -> tuple[list[str], bool]:
         try:
             parents = self.get_json(f"/repos/{repo}/commits/{sha}")["parents"]
-            if not parents:
-                _warn(f"{sha[:7]} is a root commit; changed files unknown")
-                return [], False
-            compare = self.get_json(f"/repos/{repo}/compare/{parents[0]['sha']}...{sha}")
-            files: list[Json] = compare.get("files", [])
         except (httpx.HTTPError, KeyError, ValueError) as exc:
-            _warn(f"could not get changed files for {sha[:7]}: {exc}")
+            _warn(f"could not get commit {sha[:7]}: {exc}")
+            return [], False
+        if not parents:
+            _warn(f"{sha[:7]} is a root commit; changed files unknown")
+            return [], False
+        return self._compare(repo, parents[0]["sha"], sha)
+
+    def _compare(self, repo: str, base: str, head: str) -> tuple[list[str], bool]:
+        try:
+            files: list[Json] = self.get_json(f"/repos/{repo}/compare/{base}...{head}").get(
+                "files", []
+            )
+        except (httpx.HTTPError, ValueError) as exc:
+            _warn(f"could not compare {base[:7]}...{head[:7]}: {exc}")
             return [], False
         if len(files) >= COMPARE_FILE_CAP:
-            _warn(f"{sha[:7]} changes {len(files)}+ files (list truncated); changed files unknown")
+            _warn(
+                f"{base[:7]}...{head[:7]} changes {len(files)}+ files (list truncated); "
+                "changed files unknown"
+            )
             return [], False
         paths: list[str] = []
         for entry in files:
@@ -389,7 +461,7 @@ def backfill_run(
     if expired:
         _warn(f"run {run['id']}: uploading without expired artifact(s) {', '.join(expired)}")
 
-    changed, known = github.changed_files(repo, run["head_sha"])
+    changed, known = github.changed_files(repo, run)
     response = sieve.upload(files, run_metadata(repo, run, default_branch, changed, known))
     if response.status_code == httpx.codes.CREATED:
         return Outcome.NEW, f"{_result_total(response)} results from {len(files)} file(s)"

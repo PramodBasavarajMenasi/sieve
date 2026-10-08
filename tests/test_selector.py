@@ -254,7 +254,7 @@ def test_go_root_package_needs_go_module() -> None:
 
     selection = select(GO, "commands.go", go_module=KUBO)
     assert ids(selection) == [f"{KUBO}::TestCommands"]
-    assert selection.commands == ("go test . -run '^(TestCommands)$'",)
+    assert selection.commands == ("go test .",)
 
 
 def test_go_module_makes_package_matching_exact() -> None:
@@ -410,19 +410,47 @@ def test_pytest_command_uses_node_ids_and_quotes_params() -> None:
     assert shlex.split(selection.command)[2] == "tests/test_cart.py::test_param[a b-1]"
 
 
-def test_go_commands_group_by_package_and_run_top_level_tests() -> None:
+def test_go_packages_with_changed_files_run_whole() -> None:
+    # No -run: tests added in this change aren't in history yet but must still run.
     selection = select(GO, "test/cli/add.go", "core/coreunix/add.go", go_module=KUBO)
 
-    assert selection.commands == (
-        "go test ./core/coreunix -run '^(TestAdd)$'",
-        "go test ./test/cli -run '^(TestAdd|TestPins)$'",
-    )
+    assert selection.commands == ("go test ./core/coreunix", "go test ./test/cli")
+    assert selection.go_packages_run_whole == (COREUNIX, CLI)
     assert selection.command == " && ".join(selection.commands)
+
+
+def test_go_tests_from_other_signals_keep_run_filter_by_top_level_test() -> None:
+    hist = history(
+        *GO.tests.values(),
+        recent_main_failures={
+            f"{COREUNIX}::TestAdd/ipfs_add_--to-files": (3, "a" * 40),  # subtest -> TestAdd
+            f"{CLI}::TestPins/test_pinning/test_pins_with_args={{runDaemon:true}}": (3, "a" * 40),
+        },
+    )
+    selection = select(hist, "core/coreunix/add.go", go_module=KUBO)
+
+    # coreunix has a changed file: whole package. test/cli is only in via a recent failure.
+    assert selection.commands == (
+        "go test ./core/coreunix",
+        "go test ./test/cli -run '^(TestPins)$'",
+    )
+    assert selection.go_packages_run_whole == (COREUNIX,)
+
+
+def test_go_package_selected_only_by_other_signals_is_not_run_whole() -> None:
+    hist = history(*GO.tests.values(), recent_main_failures={f"{CLI}::TestAdd": (3, "a" * 40)})
+    selection = select(hist, "README.md", go_module=KUBO)
+
+    assert selection.commands == ("go test ./test/cli -run '^(TestAdd)$'",)
+    assert selection.go_packages_run_whole == ()
 
 
 def test_go_commands_use_import_paths_without_go_module() -> None:
     selection = select(GO, "test/cli/add.go")
-    assert selection.commands == (f"go test {CLI} -run '^(TestAdd|TestPins)$'",)
+    assert selection.commands == (f"go test {CLI}",)
+
+    hist = history(*GO.tests.values(), recent_main_failures={f"{CLI}::TestAdd": (3, "a" * 40)})
+    assert select(hist, "README.md").commands == (f"go test {CLI} -run '^(TestAdd)$'",)
 
 
 def test_jest_command_lists_test_files() -> None:

@@ -82,7 +82,7 @@ def test_selective_response(client: TestClient) -> None:
     assert (body["selected_count"], body["total_known"]) == (4, 5)
     assert body["commands"] == [
         "pytest tests/test_cart.py::TestDiscount::test_applies tests/test_cart.py::test_total",
-        f"go test {GO_PKG} -run '^(TestAdd)$'",
+        f"go test {GO_PKG}",  # changed .go file: the whole package runs
     ]
     assert body["command"] == " && ".join(body["commands"])
     by_id = {t["test_id"]: t for t in body["tests"]}

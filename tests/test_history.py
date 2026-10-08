@@ -1,11 +1,12 @@
 import json
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.orm import Session
 
 from sieve.api.main import create_app
@@ -13,7 +14,7 @@ from sieve.config import Settings
 from sieve.core.history import get_test_stats
 from sieve.core.ingest import create_run
 from sieve.core.junit import ParsedTestResult, Status
-from sieve.core.models import Run, TestStats
+from sieve.core.models import Run, TestResult, TestStats
 from sieve.core.schemas import RunMetadata
 from sieve.db import get_session
 
@@ -239,6 +240,45 @@ def test_stats_are_per_repo(db_session: Session) -> None:
 
     assert stats(db_session, repo="acme/one").failures == 1
     assert stats(db_session, repo="acme/two").failures == 0
+
+
+def test_results_are_inserted_in_one_batch(db_session: Session) -> None:
+    # Regression: the ORM dropped None-valued columns and started a new INSERT batch each time
+    # the column set changed, so alternating message/file_path None-ness meant ~1 row per
+    # round trip (kubo backfill: ~23s per 4k-result run). All rows must share one statement.
+    results = [
+        ParsedTestResult(
+            test_id=f"t::case{i}",
+            classname="t",
+            name=f"case{i}",
+            file_path="tests/t.py" if i % 2 else None,
+            status=F if i % 3 == 0 else P,
+            duration_ms=i,
+            attempt=1,
+            message="boom" if i % 3 == 0 else None,
+        )
+        for i in range(200)
+    ]
+    meta = RunMetadata(repo=REPO, commit_sha=sha(1), branch="main", is_main=True)
+
+    inserts: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if statement.startswith("INSERT INTO test_results"):
+            inserts.append(statement)
+
+    engine = db_session.get_bind().engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        create_run(db_session, meta, results)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert len(inserts) == 1
+    stored = db_session.execute(
+        select(TestResult.file_path, TestResult.message).where(TestResult.test_id == "t::case3")
+    ).one()
+    assert tuple(stored) == ("tests/t.py", "boom")  # values still land in the right columns
 
 
 def test_run_is_not_committed_if_rollup_fails(

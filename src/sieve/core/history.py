@@ -29,6 +29,12 @@ from sieve.core.models import Repo, Run, TestResult, TestStats
 _ROLLUP_LOCK_NAMESPACE = 1
 
 # Recompute stats for every test in :run_id, from that test's full history in :repo_id.
+#
+# Deliberately a single pass: per-(test, run) rows, window functions for the per-commit and
+# per-main-streak facts, then one GROUP BY test_id. An earlier version built four per-test
+# CTEs and LEFT JOINed them; during a backfill the planner's row estimates lag far behind the
+# table (estimating 1 row where there are thousands), it chose nested loops over those CTEs,
+# and one ingest's rollup took ~16s instead of <1s. No CTE-to-CTE joins means no such plan.
 _ROLLUP_SQL = text(
     """
 WITH affected AS (
@@ -37,67 +43,61 @@ WITH affected AS (
 results AS (
     SELECT tr.id, tr.test_id, tr.run_id, tr.status, tr.attempt, tr.duration_ms,
            ru.commit_sha, ru.is_main, COALESCE(ru.started_at, ru.created_at) AS run_at
-    FROM test_results tr
-    JOIN affected USING (test_id)
+    FROM affected
+    JOIN test_results tr USING (test_id)
     JOIN runs ru ON ru.id = tr.run_id
     WHERE ru.repo_id = :repo_id
 ),
-outcomes AS (  -- one row per (test, run): the final attempt
-    SELECT DISTINCT ON (test_id, run_id) test_id, run_id, status, commit_sha, is_main, run_at
+per_run AS (  -- one row per (test, run)
+    SELECT test_id, run_id, commit_sha, is_main, run_at,
+           (array_agg(status ORDER BY attempt DESC, id DESC))[1] AS outcome,
+           sum(duration_ms) FILTER (WHERE status <> 'skipped') AS duration_sum,
+           count(duration_ms) FILTER (WHERE status <> 'skipped') AS duration_count,
+           bool_or(status IN ('failed', 'error')) AS any_failed,
+           bool_or(status = 'passed') AS any_passed
     FROM results
-    ORDER BY test_id, run_id, attempt DESC, id DESC
+    GROUP BY test_id, run_id, commit_sha, is_main, run_at
 ),
-run_stats AS (
-    SELECT test_id,
-           count(*) FILTER (WHERE status <> 'skipped') AS runs,
-           count(*) FILTER (WHERE status IN ('failed', 'error')) AS failures,
-           max(run_at) FILTER (WHERE status IN ('failed', 'error')) AS last_failed_at
-    FROM outcomes
+annotated AS (
+    SELECT *,
+           -- flakiness is per commit, across every run of that commit
+           bool_or(any_failed) OVER by_commit AND bool_or(any_passed) OVER by_commit
+               AS commit_flaky,
+           bool_or(any_failed OR any_passed) OVER by_commit AS commit_ran,
+           row_number() OVER (PARTITION BY test_id, commit_sha ORDER BY run_id) AS commit_row,
+           is_main AND outcome <> 'skipped' AS main_ran,
+           -- passes at or after this run on main; 0 = inside the current failing streak
+           count(*) FILTER (WHERE outcome = 'passed') OVER (
+               PARTITION BY test_id, is_main AND outcome <> 'skipped'
+               ORDER BY run_at DESC, run_id DESC
+           ) AS newer_main_passes
+    FROM per_run
+    WINDOW by_commit AS (PARTITION BY test_id, commit_sha)
+),
+stats AS (
+    SELECT :repo_id AS repo_id, test_id,
+           count(*) FILTER (WHERE outcome <> 'skipped') AS runs,
+           count(*) FILTER (WHERE outcome IN ('failed', 'error')) AS failures,
+           max(run_at) FILTER (WHERE outcome IN ('failed', 'error')) AS last_failed_at,
+           COALESCE(
+               avg(CASE WHEN commit_flaky THEN 1.0 ELSE 0.0 END)
+                   FILTER (WHERE commit_row = 1 AND commit_ran),
+               0
+           )::float8 AS flaky_score,
+           (sum(duration_sum)::numeric / NULLIF(sum(duration_count), 0))::float8
+               AS avg_duration_ms,
+           (array_agg(commit_sha ORDER BY run_at, run_id)
+               FILTER (WHERE main_ran AND newer_main_passes = 0))[1] AS broken_on_main_since_sha
+    FROM annotated
     GROUP BY test_id
-),
-durations AS (
-    SELECT test_id, avg(duration_ms) FILTER (WHERE status <> 'skipped')::float8 AS avg_ms
-    FROM results
-    GROUP BY test_id
-),
-per_commit AS (
-    SELECT test_id, commit_sha,
-           bool_or(status IN ('failed', 'error')) AND bool_or(status = 'passed') AS flaky
-    FROM results
-    WHERE status <> 'skipped'
-    GROUP BY test_id, commit_sha
-),
-flakiness AS (
-    SELECT test_id, avg(CASE WHEN flaky THEN 1.0 ELSE 0.0 END)::float8 AS score
-    FROM per_commit
-    GROUP BY test_id
-),
-main_outcomes AS (  -- rn = 1 is the latest non-skipped outcome on main
-    SELECT test_id, commit_sha, status,
-           row_number() OVER (PARTITION BY test_id ORDER BY run_at DESC, run_id DESC) AS rn
-    FROM outcomes
-    WHERE is_main AND status <> 'skipped'
-),
-latest_main_pass AS (
-    SELECT test_id, min(rn) AS rn FROM main_outcomes WHERE status = 'passed' GROUP BY test_id
-),
-broken AS (  -- everything newer than the latest pass is a failure; take the oldest of those
-    SELECT DISTINCT ON (m.test_id) m.test_id, m.commit_sha
-    FROM main_outcomes m
-    LEFT JOIN latest_main_pass p USING (test_id)
-    WHERE p.rn IS NULL OR m.rn < p.rn
-    ORDER BY m.test_id, m.rn DESC
 )
 INSERT INTO test_stats AS ts (
     repo_id, test_id, runs, failures, last_failed_at, flaky_score, avg_duration_ms,
     broken_on_main_since_sha
 )
-SELECT :repo_id, s.test_id, s.runs, s.failures, s.last_failed_at,
-       COALESCE(f.score, 0), d.avg_ms, b.commit_sha
-FROM run_stats s
-LEFT JOIN flakiness f USING (test_id)
-LEFT JOIN durations d USING (test_id)
-LEFT JOIN broken b USING (test_id)
+SELECT repo_id, test_id, runs, failures, last_failed_at, flaky_score, avg_duration_ms,
+       broken_on_main_since_sha
+FROM stats
 ON CONFLICT (repo_id, test_id) DO UPDATE SET
     runs = EXCLUDED.runs,
     failures = EXCLUDED.failures,

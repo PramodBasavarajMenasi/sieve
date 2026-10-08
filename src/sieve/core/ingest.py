@@ -74,7 +74,10 @@ def create_run(
             for r in results
         ]
         if rows:
-            session.execute(insert(TestResult), rows)
+            # render_nulls: by default the ORM drops None-valued keys and starts a new batch
+            # whenever the key set changes, so rows alternating message=None / message="..."
+            # went one or two per round trip (~20s for 4k rows over Docker networking).
+            session.execute(insert(TestResult).execution_options(render_nulls=True), rows)
         # Same transaction: stats never reflect a run that failed to commit, or vice versa.
         recompute_test_stats(session, repo_id, run.id)
         session.commit()

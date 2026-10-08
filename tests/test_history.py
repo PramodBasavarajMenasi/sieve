@@ -312,6 +312,54 @@ def test_broken_on_main_lookback_respects_variants(db_session: Session) -> None:
     ]
 
 
+# Backfill ingests old runs last, so they get the highest run IDs. The window must be cut by
+# run time (Run.occurred_at), never by ID: ID is only the lookup key and an ordering tiebreak.
+
+
+def test_window_is_by_run_time_when_old_runs_are_ingested_last(db_session: Session) -> None:
+    newest = ingest(db_session, commit=3, hour=100 * DAY, tests={"t::a": P}, duration_ms=10)
+    ingest(db_session, commit=2, hour=50 * DAY, tests={"t::a": F}, duration_ms=20)  # in window
+    old = ingest(db_session, commit=1, hour=0, tests={"t::a": F}, duration_ms=1000)  # outside
+
+    assert old.id > newest.id
+    # The day-0 run has the highest ID but is 100 days before the newest run: not counted,
+    # and it doesn't move the window's anchor either.
+    s = stats(db_session)
+    assert (s.runs, s.failures, s.last_failed_at, s.avg_duration_ms) == (2, 1, at(50 * DAY), 15.0)
+
+
+def test_repo_rollup_window_is_by_run_time_when_old_runs_are_ingested_last(
+    db_session: Session,
+) -> None:
+    # Batch backfill: deferred uploads arrive newest first, then one repo rollup.
+    for commit, day, status in [(3, 100, P), (2, 50, F), (1, 0, F)]:
+        meta = RunMetadata(
+            repo=REPO, commit_sha=sha(commit), branch="main", is_main=True, started_at=at(day * DAY)
+        )
+        result = ParsedTestResult("t::a", "t", "a", None, status, 10, 1)
+        run, _ = create_run(db_session, meta, [result], rollup=False)
+
+    history.recompute_repo_stats(db_session, run.repo_id, 90)
+
+    s = stats(db_session)
+    assert (s.runs, s.failures, s.last_failed_at) == (2, 1, at(50 * DAY))
+
+
+def test_broken_on_main_lookback_is_by_run_time_when_old_runs_are_ingested_last(
+    db_session: Session,
+) -> None:
+    ingest(db_session, commit=4, hour=140 * DAY, tests={"t::a": F})
+    ingest(db_session, commit=3, hour=50 * DAY, tests={"t::a": F})
+    ingest(db_session, commit=2, hour=10 * DAY, tests={"t::a": F})  # streak starts here
+    ingest(db_session, commit=1, hour=0, tests={"t::a": P})  # oldest, highest ID
+
+    # The streak start is found by time before the window, even though the runs were
+    # ingested newest first (so ID order is the reverse of time order).
+    s = stats(db_session)
+    assert s.broken_on_main_since_sha == sha(2)
+    assert s.runs == 2  # day 50 and day 140; days 0 and 10 are outside the window
+
+
 def _rows_read_from(plan: dict[str, Any], table: str) -> int:
     """Rows actually read from ``table`` across an EXPLAIN (ANALYZE, FORMAT JSON) plan."""
     rows = 0

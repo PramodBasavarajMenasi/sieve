@@ -133,11 +133,13 @@ _GO_TOP_LEVEL = re.compile(r"(Test|Fuzz|Example|Benchmark)")
 @dataclass(frozen=True)
 class SelectorConfig:
     always_run: tuple[str, ...] = ()
+    # The run windows below count CI runs (repo, ci_run_id, run_attempt), not uploads: a CI
+    # run with a 20-leg matrix (20 variant uploads) counts once.
     recent_main_runs: int = 10
-    # How many recent runs to search for co-change failures.
+    # How many recent CI runs to search for co-change failures.
     co_change_runs: int = 500
-    # A test is "known" only if it appeared in one of the repo's latest N runs, so deleted or
-    # renamed tests are never selected (pytest errors on node IDs that no longer exist).
+    # A test is "known" only if it appeared in one of the repo's latest N CI runs, so deleted
+    # or renamed tests are never selected (pytest errors on node IDs that no longer exist).
     known_test_runs: int = 50
     # Go module path (e.g. "github.com/ipfs/kubo"). When set, Go commands use ./relative
     # package dirs and root-package changes can be mapped; otherwise import paths are used.
@@ -663,6 +665,45 @@ def _go_target(package: str, module: str | None) -> str:
 # --- history from the database ------------------------------------------------------------
 
 
+# The repo's runs, with the columns recent_ci_runs_sql() expects.
+_REPO_RUNS = """
+repo_runs AS (
+    SELECT id, ci_run_id, run_attempt, commit_sha, is_main, changed_files_known,
+           COALESCE(started_at, created_at) AS run_at
+    FROM runs WHERE repo_id = :repo_id
+)
+"""
+
+
+def recent_ci_runs_sql(source: str, condition: str = "true") -> str:
+    """CTEs ``recent_ci`` and ``recent``: every run of the latest ``:n`` *CI runs* in ``source``.
+
+    A CI run is ``(ci_run_id, run_attempt)``: all its matrix variants (one upload each) count
+    once, so "the last 50 runs" means 50 CI runs whether the matrix has 1 leg or 20. Runs
+    without a ``ci_run_id`` count on their own. ``source`` must have ``id, ci_run_id,
+    run_attempt, commit_sha, run_at``; ``condition`` filters it (e.g. ``is_main``).
+    ``recent`` has ``id, commit_sha, run_at``. ``condition`` may only use ``source`` columns
+    that ``recent_ci`` doesn't have (e.g. ``is_main``), so they need no qualifier.
+    """
+    return f"""
+recent_ci AS (
+    SELECT COALESCE(ci_run_id, 'run:' || id) AS ci_key, run_attempt,
+           max(run_at) AS ci_at, max(id) AS ci_id
+    FROM {source} WHERE {condition}
+    GROUP BY 1, 2
+    ORDER BY ci_at DESC, ci_id DESC
+    LIMIT :n
+),
+recent AS (
+    SELECT s.id, s.commit_sha, s.run_at
+    FROM {source} s
+    JOIN recent_ci c
+      ON COALESCE(s.ci_run_id, 'run:' || s.id) = c.ci_key AND s.run_attempt = c.run_attempt
+    WHERE {condition}
+)
+"""
+
+
 def load_history(
     session: Session, repo: str, config: SelectorConfig | None = None
 ) -> RepoHistory | None:
@@ -677,12 +718,8 @@ def load_history(
 
     known = session.execute(
         text(
-            """
-            WITH recent AS (
-                SELECT id FROM runs WHERE repo_id = :repo_id
-                ORDER BY COALESCE(started_at, created_at) DESC, id DESC
-                LIMIT :n
-            )
+            f"""
+            WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs")}
             SELECT DISTINCT ON (tr.test_id) tr.test_id, tr.file_path
             FROM test_results tr JOIN recent ON recent.id = tr.run_id
             ORDER BY tr.test_id, tr.file_path IS NULL, tr.run_id DESC
@@ -701,13 +738,8 @@ def load_history(
 
     recent_failures = session.execute(
         text(
-            """
-            WITH recent AS (
-                SELECT id, commit_sha, COALESCE(started_at, created_at) AS run_at
-                FROM runs WHERE repo_id = :repo_id AND is_main
-                ORDER BY run_at DESC, id DESC
-                LIMIT :n
-            )
+            f"""
+            WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs", "is_main")}
             SELECT DISTINCT ON (tr.test_id) tr.test_id, recent.id, recent.commit_sha
             FROM recent JOIN test_results tr ON tr.run_id = recent.id
             WHERE tr.status IN ('failed', 'error')
@@ -719,13 +751,8 @@ def load_history(
 
     failed = session.execute(
         text(
-            """
-            WITH recent AS (
-                SELECT id, commit_sha, COALESCE(started_at, created_at) AS run_at
-                FROM runs WHERE repo_id = :repo_id AND changed_files_known
-                ORDER BY run_at DESC, id DESC
-                LIMIT :n
-            )
+            f"""
+            WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs", "changed_files_known")}
             SELECT recent.id, recent.commit_sha, array_agg(DISTINCT tr.test_id)
             FROM recent JOIN test_results tr ON tr.run_id = recent.id
             WHERE tr.status IN ('failed', 'error')

@@ -55,7 +55,7 @@ from sqlalchemy.orm import Session
 if not __package__:  # run as a file path: make the repo root importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.eval.pygraph import PyGraph, build_py_graph, test_file_for
+from scripts.eval.pygraph import PyGraph, build_py_graph, module_of_test
 from sieve.cli.gograph import GoGraph, build_graph, parse_go_list
 from sieve.cli.repoconfig import load_repo_config, read_go_module
 from sieve.core.selector import (
@@ -69,11 +69,14 @@ from sieve.core.selector import (
     build_file_scope,
     is_build_file,
     is_ignorable,
+    recent_ci_runs_sql,
     select_tests,
 )
 from sieve.db import get_sessionmaker
 
 FAILED = ("failed", "error")
+# Main CI runs read to recompute broken-on-main per target (see broken_on_main_before).
+BROKEN_LOOKBACK_CI_RUNS = 20
 COMPARE_FILE_CAP = 300
 
 
@@ -130,7 +133,7 @@ class Result:
 # Runs of the repo strictly before (:at, :run_id). Every history query starts from this.
 _PRIOR = """
 prior AS (
-    SELECT id, commit_sha, is_main, changed_files_known, variant,
+    SELECT id, ci_run_id, run_attempt, commit_sha, is_main, changed_files_known, variant,
            COALESCE(started_at, created_at) AS run_at
     FROM runs
     WHERE repo_id = :repo_id
@@ -148,8 +151,7 @@ def history_before(
     known = session.execute(
         text(
             f"""
-            WITH {_PRIOR},
-            recent AS (SELECT id FROM prior ORDER BY run_at DESC, id DESC LIMIT :n)
+            WITH {_PRIOR}, {recent_ci_runs_sql("prior")}
             SELECT DISTINCT ON (tr.test_id) tr.test_id, tr.file_path
             FROM test_results tr JOIN recent ON recent.id = tr.run_id
             ORDER BY tr.test_id, tr.file_path IS NULL, tr.run_id DESC
@@ -161,11 +163,7 @@ def history_before(
     recent_failures = session.execute(
         text(
             f"""
-            WITH {_PRIOR},
-            recent AS (
-                SELECT id, commit_sha, run_at FROM prior WHERE is_main
-                ORDER BY run_at DESC, id DESC LIMIT :n
-            )
+            WITH {_PRIOR}, {recent_ci_runs_sql("prior", "is_main")}
             SELECT DISTINCT ON (tr.test_id) tr.test_id, recent.id, recent.commit_sha
             FROM recent JOIN test_results tr ON tr.run_id = recent.id
             WHERE tr.status IN ('failed', 'error')
@@ -178,11 +176,7 @@ def history_before(
     failed = session.execute(
         text(
             f"""
-            WITH {_PRIOR},
-            recent AS (
-                SELECT id, commit_sha, run_at FROM prior WHERE changed_files_known
-                ORDER BY run_at DESC, id DESC LIMIT :n
-            )
+            WITH {_PRIOR}, {recent_ci_runs_sql("prior", "changed_files_known")}
             SELECT recent.id, recent.commit_sha, array_agg(DISTINCT tr.test_id)
             FROM recent JOIN test_results tr ON tr.run_id = recent.id
             WHERE tr.status IN ('failed', 'error')
@@ -206,24 +200,29 @@ def history_before(
 
 
 def broken_on_main_before(session: Session, params: dict[str, Any]) -> dict[str, str]:
-    """Same definition as core/history.py, computed from main runs before the cutoff only.
+    """Same definition as core/history.py, from main runs before the cutoff only.
 
     Per variant: a test is broken if any variant's latest main outcome is a failure; the sha
-    is the earliest streak start across broken variants.
+    is the earliest streak start across broken variants. Only the last
+    ``BROKEN_LOOKBACK_CI_RUNS`` main CI runs are read: the selector only uses *whether* a test
+    is broken (a test whose latest main outcome failed is in those runs), so this changes at
+    most the streak sha in a reason, never which tests are selected. Reading every earlier
+    main run would scan millions of rows per target on a large matrix repo.
     """
     rows = session.execute(
         text(
             f"""
-            WITH {_PRIOR}
-            SELECT DISTINCT ON (tr.test_id, prior.id)
-                   tr.test_id, COALESCE(prior.variant, ''), prior.id, prior.run_at,
-                   prior.commit_sha, tr.status
-            FROM prior JOIN test_results tr ON tr.run_id = prior.id
-            WHERE prior.is_main
-            ORDER BY tr.test_id, prior.id, tr.attempt DESC, tr.id DESC
+            WITH {_PRIOR}, {recent_ci_runs_sql("prior", "is_main")}
+            SELECT DISTINCT ON (tr.test_id, recent.id)
+                   tr.test_id, COALESCE(prior.variant, ''), recent.id, recent.run_at,
+                   recent.commit_sha, tr.status
+            FROM recent
+            JOIN prior ON prior.id = recent.id
+            JOIN test_results tr ON tr.run_id = recent.id
+            ORDER BY tr.test_id, recent.id, tr.attempt DESC, tr.id DESC
             """
         ),
-        params,
+        {**params, "n": BROKEN_LOOKBACK_CI_RUNS},
     ).all()
     outcomes: dict[tuple[str, str], list[tuple[datetime, int, str, str]]] = defaultdict(list)
     for test_id, variant, run_id, run_at, sha, status in rows:
@@ -512,7 +511,7 @@ class Explainer:
         )  # fmt: skip
 
     def _python(self, test_id: str) -> Missed:
-        test_file = test_file_for(test_id)
+        test_file = module_of_test(test_id)
         changed_py = {p for p in self.changed_files if p.endswith(".py")}
         graph = self.graphs.py_graph_at(self.sha) if test_file and changed_py else None
         if test_file and graph and test_file in graph.edges:

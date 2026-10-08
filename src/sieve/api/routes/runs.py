@@ -18,6 +18,8 @@ from fastapi import (
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from sieve.api.deps import get_app_settings
+from sieve.config import Settings
 from sieve.core.ingest import count_results, create_run, find_existing_run, find_run
 from sieve.core.junit import JUnitParseError, ParsedTestResult, parse_junit
 from sieve.core.schemas import RunLookupResponse, RunMetadata, RunResponse
@@ -73,8 +75,16 @@ def post_run(
     session: Annotated[Session, Depends(get_session)],
     files: Annotated[list[UploadFile], File(description="One or more JUnit XML files")],
     metadata: Annotated[str, Form(description="RunMetadata as a JSON string")],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    defer_rollup: Annotated[
+        bool,
+        Query(
+            description="Batch mode: store the run without updating test_stats. Stats stay "
+            "stale until POST /repos/{repo}/rollup."
+        ),
+    ] = False,
 ) -> RunResponse:
-    """Record a CI run. Idempotent per ``(repo, ci_run_id, run_attempt)``."""
+    """Record a CI run. Idempotent per ``(repo, ci_run_id, run_attempt, variant)``."""
     try:
         meta = RunMetadata.model_validate_json(metadata)
     except ValidationError as exc:
@@ -90,7 +100,13 @@ def post_run(
     existing = find_existing_run(session, meta)
     if existing is None:
         results = _parse_files(files)
-        run, created = create_run(session, meta, results)
+        run, created = create_run(
+            session,
+            meta,
+            results,
+            rollup=not defer_rollup,
+            window_days=settings.stats_window_days,
+        )
     else:
         run, created = existing, False
 
@@ -109,6 +125,7 @@ def post_run(
         repo=meta.repo,
         created=created,
         counts=count_results(session, run.id),
+        stats_deferred=created and defer_rollup,
     )
 
 

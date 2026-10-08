@@ -57,6 +57,9 @@ select = [
     "RUF", # ruff-specific
 ]
 
+[tool.ruff.lint.isort]
+known-first-party = ["scripts", "sieve", "tests"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true

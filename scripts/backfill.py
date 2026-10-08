@@ -52,6 +52,8 @@ class Outcome(StrEnum):
 @dataclass
 class Summary:
     counts: dict[Outcome, int] = field(default_factory=lambda: dict.fromkeys(Outcome, 0))
+    # Batch mode only: why the final POST /repos/{repo}/rollup failed, if it did.
+    rollup_error: str | None = None
 
     def add(self, outcome: Outcome) -> None:
         self.counts[outcome] += 1
@@ -349,7 +351,9 @@ class GitHubClient:
 
 
 class SieveClient:
-    def __init__(self, server: str, token: str) -> None:
+    def __init__(self, server: str, token: str, *, defer_rollup: bool = False) -> None:
+        # Batch mode: uploads skip the per-run stats rollup; call rollup() once at the end.
+        self.defer_rollup = defer_rollup
         self._http = httpx.Client(
             base_url=server, headers={"Authorization": f"Bearer {token}"}, timeout=300
         )
@@ -386,9 +390,17 @@ class SieveClient:
     def upload(self, files: list[tuple[str, bytes]], metadata: Json) -> httpx.Response:
         return self._http.post(
             "/runs",
+            params={"defer_rollup": "true"} if self.defer_rollup else None,
             files=[("files", (name, content, "application/xml")) for name, content in files],
             data={"metadata": json.dumps(metadata)},
         )
+
+    def rollup(self, repo: str) -> Json:
+        """Recompute the repo's test_stats (after batch uploads). Can take minutes."""
+        response = self._http.post(f"/repos/{repo}/rollup", timeout=3600)
+        response.raise_for_status()
+        result: Json = response.json()
+        return result
 
 
 # --- backfill -----------------------------------------------------------------------------
@@ -598,6 +610,18 @@ def backfill(
         for variant, outcome, detail in results:
             summary.add(outcome)
             echo(f"{label}{f' [{variant}]' if variant else ''}: {outcome.value} ({detail})")
+    if sieve.defer_rollup:
+        # Stats were left stale by every batch upload; bring them up to date once.
+        try:
+            result = sieve.rollup(repo)
+        except httpx.HTTPError as exc:
+            summary.rollup_error = f"{type(exc).__name__}: {exc}"
+            echo(f"rollup failed: {summary.rollup_error}")
+        else:
+            echo(
+                f"rollup: {result.get('tests_updated')} tests updated in "
+                f"{result.get('seconds')}s (window {result.get('window_days')} days)"
+            )
     return summary
 
 
@@ -619,6 +643,14 @@ def main(
         int, typer.Option(min=1, help="Most recent completed runs to process.")
     ] = 200,
     server: Annotated[str, typer.Option(help="sieve server URL.")] = "http://localhost:8000",
+    batch: Annotated[
+        bool,
+        typer.Option(
+            "--batch",
+            help="Upload without per-run stats updates, then recompute stats once at the end "
+            "(much faster for large backfills; stats are stale until it finishes).",
+        ),
+    ] = False,
 ) -> None:
     """Backfill sieve from past GitHub Actions runs. Tokens: GITHUB_TOKEN, SIEVE_API_TOKEN."""
     github_token = os.environ.get("GITHUB_TOKEN")
@@ -635,7 +667,10 @@ def main(
         typer.echo(f"error: --repo must be owner/name, got {repo!r}", err=True)
         raise typer.Exit(2)
 
-    with GitHubClient(github_token) as github, SieveClient(server, sieve_token) as sieve:
+    with (
+        GitHubClient(github_token) as github,
+        SieveClient(server, sieve_token, defer_rollup=batch) as sieve,
+    ):
         try:
             summary = backfill(
                 github,
@@ -650,7 +685,11 @@ def main(
             raise typer.Exit(2) from exc
 
     typer.echo(f"\nsummary: {summary}")
-    if summary.counts[Outcome.ERROR]:
+    if summary.rollup_error:
+        typer.echo(
+            f"error: stats are stale; retry with: POST {server}/repos/{repo}/rollup", err=True
+        )
+    if summary.counts[Outcome.ERROR] or summary.rollup_error:
         raise typer.Exit(1)
 
 

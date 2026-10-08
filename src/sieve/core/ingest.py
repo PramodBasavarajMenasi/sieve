@@ -38,10 +38,18 @@ def find_existing_run(session: Session, meta: RunMetadata) -> Run | None:
 
 
 def create_run(
-    session: Session, meta: RunMetadata, results: Iterable[ParsedTestResult]
+    session: Session,
+    meta: RunMetadata,
+    results: Iterable[ParsedTestResult],
+    *,
+    rollup: bool = True,
+    window_days: int = 90,
 ) -> tuple[Run, bool]:
     """Insert the run, its changed files and results, and roll up ``test_stats`` for the
-    run's tests, all in one transaction.
+    run's tests over the last ``window_days``, all in one transaction.
+
+    With ``rollup=False`` (batch ingest) stats are left stale until
+    ``history.recompute_repo_stats`` runs.
 
     Returns ``(run, created)``. If a concurrent upload of the same CI run attempt wins the
     race, this transaction is rolled back and the winner's run is returned with
@@ -85,7 +93,8 @@ def create_run(
             # went one or two per round trip (~20s for 4k rows over Docker networking).
             session.execute(insert(TestResult).execution_options(render_nulls=True), rows)
         # Same transaction: stats never reflect a run that failed to commit, or vice versa.
-        recompute_test_stats(session, repo_id, run.id)
+        if rollup:  # skipped in batch mode; POST /repos/{repo}/rollup catches up later
+            recompute_test_stats(session, repo_id, run.id, window_days)
         session.commit()
     except IntegrityError as exc:
         session.rollback()

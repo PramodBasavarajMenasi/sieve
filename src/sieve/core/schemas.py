@@ -76,6 +76,18 @@ class RunResponse(BaseModel):
     repo: str
     created: bool
     counts: StatusCounts
+    stats_deferred: bool = Field(
+        default=False,
+        description="True if uploaded with defer_rollup: test_stats are stale until "
+        "POST /repos/{repo}/rollup",
+    )
+
+
+class RollupResponse(BaseModel):
+    repo: str
+    tests_updated: int
+    window_days: int = Field(description="Stats window (0 = all history)")
+    seconds: float
 
 
 class RunLookupResponse(BaseModel):

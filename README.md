@@ -103,5 +103,21 @@ uv run python scripts/backfill.py --repo acme/shop --server http://localhost:800
 - If the changed files can't be determined, the run is uploaded with `changed_files_known:
   false`. That covers a failed compare, a root commit, or more than 300 changed files. Test
   selection will run the full suite for such runs.
+- Each matching artifact is uploaded as its own run, a *variant* (e.g. `3.12-ubuntu-latest`
+  for a matrix leg). Results are only compared within a variant, so a test that passes on
+  Linux and fails on macOS isn't counted as flaky.
+- **`--batch`** for large backfills: uploads skip the per-run stats update
+  (`POST /runs?defer_rollup=true`) and the script calls `POST /repos/{repo}/rollup` once at
+  the end. Per-test stats (and the selector's broken-on-main signal) are **stale until that
+  rollup finishes**. If the script is interrupted, run the rollup yourself:
+  `curl -X POST -H "Authorization: Bearer $SIEVE_API_TOKEN" $SERVER/repos/owner/name/rollup`.
+
+### Stats window
+
+Per-test stats are computed over the last `SIEVE_STATS_WINDOW_DAYS` days (default 90; `0` =
+all history), counted back from the repo's most recent run. Each ingest only reads results
+inside that window, so its cost doesn't grow with how much history is stored. Broken-on-main
+is the exception: when a test has failed on main for the whole window, older main results are
+read to find where its failing streak started.
 
 License: Apache-2.0

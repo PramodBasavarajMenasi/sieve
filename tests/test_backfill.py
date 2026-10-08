@@ -10,9 +10,10 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from typer.testing import CliRunner
+
 from scripts import backfill as bf
 from scripts.backfill import BackfillError, GitHubClient, SieveClient, Summary
-from typer.testing import CliRunner
 
 GH = "https://api.github.com"
 SIEVE = "http://sieve.test"
@@ -140,7 +141,7 @@ def run_backfill(clock: FakeClock, **kwargs: Any) -> tuple[Summary, list[str]]:
     lines: list[str] = []
     with (
         GitHubClient("gh-token", sleep=clock.sleep, clock=clock.time, **kwargs.pop("gh", {})) as gh,
-        SieveClient(SIEVE, "sieve-token") as sieve,
+        SieveClient(SIEVE, "sieve-token", defer_rollup=kwargs.pop("batch", False)) as sieve,
     ):
         summary = bf.backfill(gh, sieve, REPO, echo=lines.append, **kwargs)
     return summary, lines
@@ -914,6 +915,70 @@ def test_workflow_filter_uses_workflow_runs_endpoint(
 
 
 # --- CLI ----------------------------------------------------------------------------------
+
+
+# --- batch mode ---------------------------------------------------------------------------
+
+
+def test_batch_mode_defers_rollup_and_runs_it_once(
+    router: respx.MockRouter, clock: FakeClock
+) -> None:
+    mock_runs(router, gh_run(1), gh_run(2))
+    standard_run(router, gh_run(1))
+    standard_run(router, gh_run(2))
+    mock_changed_files(router, [])
+    sieve = mock_sieve(router, 201, 201)
+    rollup = router.post(f"{SIEVE}/repos/{REPO}/rollup").respond(
+        json={"repo": REPO, "tests_updated": 7, "window_days": 90, "seconds": 1.5}
+    )
+
+    summary, lines = run_backfill(clock, batch=True)
+
+    assert counts(summary) == {"new": 2}
+    assert [call.request.url.params.get("defer_rollup") for call in sieve.calls] == [
+        "true",
+        "true",
+    ]
+    assert rollup.call_count == 1  # once, after every upload
+    assert lines[-1] == "rollup: 7 tests updated in 1.5s (window 90 days)"
+    assert summary.rollup_error is None
+
+
+def test_normal_mode_does_not_defer_or_roll_up(router: respx.MockRouter, clock: FakeClock) -> None:
+    mock_runs(router, gh_run(1))
+    standard_run(router, gh_run(1))
+    mock_changed_files(router, [])
+    sieve = mock_sieve(router, 201)
+    rollup = router.post(f"{SIEVE}/repos/{REPO}/rollup").respond(json={})
+
+    run_backfill(clock)
+
+    assert "defer_rollup" not in sieve.calls.last.request.url.params
+    assert not rollup.called
+
+
+def test_batch_rollup_failure_is_reported(router: respx.MockRouter, clock: FakeClock) -> None:
+    mock_runs(router)
+    router.post(f"{SIEVE}/repos/{REPO}/rollup").respond(500)
+
+    summary, lines = run_backfill(clock, batch=True)
+
+    assert summary.rollup_error is not None and "500" in summary.rollup_error
+    assert lines[-1].startswith("rollup failed: HTTPStatusError")
+
+
+def test_cli_batch_rollup_failure_exits_1(
+    router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+    monkeypatch.setenv("SIEVE_API_TOKEN", "sieve-token")
+    mock_runs(router)
+    router.post(f"{SIEVE}/repos/{REPO}/rollup").respond(503)
+
+    result = CliRunner().invoke(bf.app, ["--repo", REPO, "--server", SIEVE, "--batch"])
+
+    assert result.exit_code == 1
+    assert f"POST {SIEVE}/repos/{REPO}/rollup" in result.stderr
 
 
 def test_cli_prints_summary_and_exit_code(

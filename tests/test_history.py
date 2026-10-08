@@ -6,11 +6,12 @@ from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import event, func, select, update
+from sqlalchemy import event, func, select, text, update
 from sqlalchemy.orm import Session
 
 from sieve.api.main import create_app
 from sieve.config import Settings
+from sieve.core import history
 from sieve.core.history import get_test_stats
 from sieve.core.ingest import create_run
 from sieve.core.junit import ParsedTestResult, Status
@@ -43,6 +44,7 @@ def ingest(
     variant: str | None = None,
     repo: str = REPO,
     duration_ms: int | None = 10,
+    window_days: int = 90,
 ) -> Run:
     """Ingest one run. A sequence of statuses means successive attempts of that test."""
     results = []
@@ -70,7 +72,7 @@ def ingest(
         variant=variant,
         started_at=None if hour is None else at(hour),
     )
-    run, created = create_run(session, meta, results)
+    run, created = create_run(session, meta, results, window_days=window_days)
     assert created
     return run
 
@@ -254,6 +256,109 @@ def test_history_api_reports_variants(client: TestClient, db_session: Session) -
         (MACOS, "failed"),
         (LINUX, "passed"),
     ]
+
+
+# --- stats window -------------------------------------------------------------------------
+
+DAY = 24  # hours
+
+
+def test_stats_only_count_the_window(db_session: Session) -> None:
+    ingest(db_session, commit=1, hour=0, tests={"t::a": F}, duration_ms=1000)
+    ingest(db_session, commit=2, hour=100 * DAY, tests={"t::a": P}, duration_ms=10)
+
+    # Window = 90 days up to the newest run (day 100): the day-0 failure is outside it.
+    s = stats(db_session)
+    assert (s.runs, s.failures, s.last_failed_at, s.avg_duration_ms) == (1, 0, None, 10.0)
+
+
+def test_window_of_zero_means_all_history(db_session: Session) -> None:
+    ingest(db_session, commit=1, hour=0, tests={"t::a": F}, window_days=0)
+    ingest(db_session, commit=2, hour=100 * DAY, tests={"t::a": P}, window_days=0)
+
+    assert (stats(db_session).runs, stats(db_session).failures) == (2, 1)
+
+
+def test_window_is_anchored_on_the_newest_run_not_today(db_session: Session) -> None:
+    # T0 is 2026-01-01; a "now"-anchored 90-day window would see none of this.
+    ingest(db_session, commit=1, hour=0, tests={"t::a": F})
+    assert stats(db_session).runs == 1
+
+
+def test_broken_on_main_streak_start_is_found_before_the_window(db_session: Session) -> None:
+    ingest(db_session, commit=1, hour=0, tests={"t::a": P})
+    ingest(db_session, commit=2, hour=10 * DAY, tests={"t::a": F})  # streak starts here
+    ingest(db_session, commit=3, hour=50 * DAY, tests={"t::a": F})
+    ingest(db_session, commit=4, hour=140 * DAY, tests={"t::a": F})
+
+    # The window (day 50..140) only holds failures; the streak began at day 10.
+    s = stats(db_session)
+    assert s.broken_on_main_since_sha == sha(2)
+    assert s.broken_on_main_variants == [{"variant": None, "since_sha": sha(2)}]
+    assert s.runs == 2  # counts stay inside the window
+
+
+def test_broken_on_main_lookback_respects_variants(db_session: Session) -> None:
+    linux, macos = "ubuntu", "macos"
+    ingest(db_session, commit=1, hour=0, tests={"t::a": F}, ci_run_id="1", variant=linux)
+    ingest(db_session, commit=1, hour=0, tests={"t::a": P}, ci_run_id="1", variant=macos)
+    ingest(db_session, commit=2, hour=200 * DAY, tests={"t::a": F}, ci_run_id="2", variant=linux)
+    ingest(db_session, commit=2, hour=200 * DAY, tests={"t::a": F}, ci_run_id="2", variant=macos)
+
+    # Linux has failed since commit 1 (before the window); macOS only since commit 2.
+    assert stats(db_session).broken_on_main_variants == [
+        {"variant": linux, "since_sha": sha(1)},
+        {"variant": macos, "since_sha": sha(2)},
+    ]
+
+
+def _rows_read_from(plan: dict[str, Any], table: str) -> int:
+    """Rows actually read from ``table`` across an EXPLAIN (ANALYZE, FORMAT JSON) plan."""
+    rows = 0
+    if plan.get("Relation Name") == table:
+        rows += plan.get("Actual Rows", 0) * plan.get("Actual Loops", 0)
+    for child in plan.get("Plans", []):
+        rows += _rows_read_from(child, table)
+    return rows
+
+
+def test_rollup_reads_only_the_window_not_old_history(db_session: Session) -> None:
+    tests = [f"t::case{i}" for i in range(20)]
+    # 300 old runs (a year before the window) of the same 20 tests, inserted directly.
+    repo_run = ingest(db_session, commit=1, hour=0, tests=dict.fromkeys(tests, P))
+    repo_id = repo_run.repo_id
+    db_session.execute(
+        text(
+            """
+            WITH old AS (
+                INSERT INTO runs (repo_id, commit_sha, branch, is_main, ci_run_id, started_at)
+                SELECT :repo_id, lpad(to_hex(n), 40, '0'), 'main', true, 'old-' || n,
+                       CAST(:t0 AS timestamptz) - make_interval(days => 400) + n * interval '1 hour'
+                FROM generate_series(1, 300) n
+                RETURNING id
+            )
+            INSERT INTO test_results (run_id, test_id, status, duration_ms, attempt)
+            SELECT old.id, t, 'passed', 5, 1 FROM old CROSS JOIN unnest(CAST(:tests AS text[])) t
+            """
+        ),
+        {"repo_id": repo_id, "t0": T0, "tests": tests},
+    )
+    newest = ingest(db_session, commit=2, hour=1, tests=dict.fromkeys(tests, F))
+    in_window = 2 * len(tests)  # two runs inside the window
+    # Fresh statistics, as autovacuum would produce: without the OFFSET 0 fences the planner
+    # then flattens the LATERAL lookups and hash-joins a scan of all 6,000+ rows.
+    db_session.execute(text("ANALYZE test_results"))
+    db_session.execute(text("ANALYZE runs"))
+
+    plan = db_session.execute(
+        text("EXPLAIN (ANALYZE, FORMAT JSON) " + str(history._RUN_ROLLUP_SQL)),
+        {"repo_id": repo_id, "run_id": newest.id, "window_days": 90},
+    ).scalar_one()[0]["Plan"]
+
+    read = _rows_read_from(plan, "test_results")
+    assert in_window <= read <= in_window * 2  # window rows (+ the run's test list), not 6,000
+    assert db_session.scalar(select(func.count()).select_from(TestResult)) == 300 * 20 + in_window
+    assert stats(db_session, "t::case0").runs == 2
 
 
 # --- out-of-order (backfill) ingest -------------------------------------------------------

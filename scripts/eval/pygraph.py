@@ -30,6 +30,8 @@ class PyGraph:
 
     def import_chain(self, test_file: str, targets: set[str]) -> list[str] | None:
         """Shortest import chain from ``test_file`` (plus its conftests) to any target."""
+        if test_file not in self.edges:
+            return None  # unknown (e.g. deleted) test file: nothing to claim
         starts = [test_file, *conftests_for(test_file, self.edges)]
         parent: dict[str, str | None] = {s: None for s in starts if s in self.edges}
         queue = deque(parent)
@@ -66,7 +68,7 @@ def conftests_for(test_file: str, edges: Mapping[str, Any]) -> list[str]:
         directory = posixpath.dirname(directory)
 
 
-def test_file_for(test_id: str) -> str | None:
+def module_of_test(test_id: str) -> str | None:
     """A pytest test ID's module: ``test.test_graph.TestX::t`` -> ``test/test_graph.py``."""
     parts = test_id.partition("::")[0].split(".")
     modules = [i for i, p in enumerate(parts) if p.startswith("test_") or p.endswith("_test")]

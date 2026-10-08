@@ -1,5 +1,6 @@
 import shlex
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy.orm import Session
@@ -695,6 +696,8 @@ def ingest(
     is_main: bool = True,
     changed: tuple[str, ...] = (),
     changed_known: bool = True,
+    ci_run_id: str | None = None,
+    variant: str | None = None,
 ) -> int:
     results = [
         ParsedTestResult(
@@ -716,12 +719,63 @@ def ingest(
         started_at=T0 + timedelta(hours=n),
         changed_files=list(changed),
         changed_files_known=changed_known,
+        ci_run_id=ci_run_id,
+        variant=variant,
     )
     run, _ = create_run(session, meta, results)
     return run.id
 
 
 P, F = Status.PASSED, Status.FAILED
+
+
+MATRIX_LEGS = [f"py3.{minor}-{os}" for minor in (10, 11, 12, 13, 14)
+               for os in ("ubuntu", "macos", "windows", "ubuntu-extensive")]  # fmt: skip
+
+
+def ingest_matrix(session: Session, n: int, tests: dict[str, Status], **kwargs: Any) -> None:
+    """One CI run uploaded as 20 matrix variants (one run row each)."""
+    for leg in MATRIX_LEGS:
+        ingest(session, n, tests, ci_run_id=str(n), variant=leg, **kwargs)
+
+
+def test_known_tests_window_counts_ci_runs_not_variants(db_session: Session) -> None:
+    assert len(MATRIX_LEGS) == 20
+    ingest_matrix(db_session, 1, {"tests.test_a::test_x": P, "tests.test_old::test_gone": P})
+    ingest_matrix(db_session, 2, {"tests.test_a::test_x": P})
+
+    # 2 CI runs = 40 uploads. Counting uploads, "last 2 runs" would be two legs of CI run 2.
+    two = load_history(db_session, REPO, SelectorConfig(known_test_runs=2))
+    one = load_history(db_session, REPO, SelectorConfig(known_test_runs=1))
+    assert two is not None and one is not None
+    assert set(two.tests) == {"tests.test_a::test_x", "tests.test_old::test_gone"}
+    assert set(one.tests) == {"tests.test_a::test_x"}
+
+
+def test_recent_main_failures_window_counts_ci_runs(db_session: Session) -> None:
+    # CI run 1 fails on one leg; CI run 2 passes on all 20 legs.
+    for leg in MATRIX_LEGS:
+        status = F if leg == "py3.12-macos" else P
+        ingest(db_session, 1, {"tests.test_a::test_x": status}, ci_run_id="1", variant=leg)
+    ingest_matrix(db_session, 2, {"tests.test_a::test_x": P})
+
+    two = load_history(db_session, REPO, SelectorConfig(recent_main_runs=2))
+    one = load_history(db_session, REPO, SelectorConfig(recent_main_runs=1))
+    assert two is not None and one is not None
+    assert set(two.recent_main_failures) == {"tests.test_a::test_x"}
+    assert one.recent_main_failures == {}
+
+
+def test_co_change_window_counts_ci_runs(db_session: Session) -> None:
+    for leg in MATRIX_LEGS:
+        status = F if leg == "py3.10-ubuntu" else P
+        ingest(db_session, 1, {"tests.test_a::test_x": status}, ci_run_id="1", variant=leg,
+               changed=("src/a.py",))  # fmt: skip
+    ingest_matrix(db_session, 2, {"tests.test_a::test_x": P}, changed=("src/b.py",))
+
+    hist = load_history(db_session, REPO, SelectorConfig(co_change_runs=2))
+    assert hist is not None
+    assert [r.failed_tests for r in hist.failed_runs] == [frozenset({"tests.test_a::test_x"})]
 
 
 def test_load_history_unknown_repo(db_session: Session) -> None:

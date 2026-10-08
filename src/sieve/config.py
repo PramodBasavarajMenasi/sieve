@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,6 +12,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://sieve:sieve@localhost:5432/sieve"
     api_token: str | None = None
     max_upload_bytes: int = 50 * 1024 * 1024
+    # test_stats are computed over this many days up to a repo's newest run (0 = all history).
+    stats_window_days: int = Field(default=90, ge=0)
 
 
 @lru_cache

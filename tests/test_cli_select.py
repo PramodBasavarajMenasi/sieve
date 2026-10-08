@@ -10,6 +10,7 @@ import respx
 from typer.testing import CliRunner, Result
 
 from sieve.cli.main import app, parse_name_status
+from tests.gofixture import M, go_list_packages
 
 SERVER = "http://sieve.test"
 SELECT_URL = f"{SERVER}/select"
@@ -111,6 +112,9 @@ def test_prints_command_for_branch_diff(api: respx.MockRouter) -> None:
             "src/with space.py",
         ],
         "changed_files_known": True,
+        # No .sieve.toml and no go.mod: empty rules, no go_module or affected_packages.
+        "depends": [],
+        "always_run": [],
     }
 
 
@@ -247,6 +251,118 @@ def test_missing_token_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
     result = run()
     assert result.exit_code == 2
     assert "SIEVE_API_TOKEN" in result.stderr
+
+
+# --- Go import graph and .sieve.toml ------------------------------------------------------
+
+SIEVE_TOML = """
+always_run = ["smoke/**"]
+
+[[depends]]
+tests = "e2e/**"
+on = ["**/*.go", "!**/*_test.go"]
+"""
+
+
+@pytest.fixture
+def go_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A Go module (see tests/gofixture.py) whose feature branch changes package a."""
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.email", "t@example.com")
+    git(tmp_path, "config", "user.name", "Test")
+    git(tmp_path, "config", "commit.gpgsign", "false")
+    (tmp_path / "go.mod").write_text(f"module {M}\n\ngo 1.24\n")
+    (tmp_path / ".sieve.toml").write_text(SIEVE_TOML)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "a.go").write_text("package a\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "base")
+    git(tmp_path, "checkout", "-q", "-b", "feature")
+    (tmp_path / "a" / "a.go").write_text("package a\n\nvar X = 1\n")
+    git(tmp_path, "commit", "-q", "-am", "change a")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_go_dependents_and_repo_config_are_sent(
+    go_repo: Path, api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots: list[Path] = []
+
+    def fake_go_list(root: Path) -> list[dict[str, Any]]:
+        roots.append(root)
+        return go_list_packages(root)
+
+    monkeypatch.setattr("sieve.cli.main.run_go_list", fake_go_list)
+    route = api.post(SELECT_URL).respond(json=response())
+
+    result = run()
+
+    assert result.exit_code == 0, result.output
+    assert roots[0].resolve() == go_repo.resolve()  # go list runs at the repo root
+    body = sent(route)
+    assert body["go_module"] == M
+    assert body["affected_packages"] == {
+        f"{M}/a": [f"{M}/a"],
+        f"{M}/b": [f"{M}/a"],
+        f"{M}/c": [f"{M}/a"],
+        f"{M}/notests": [f"{M}/a"],
+    }
+    assert body["depends"] == [{"tests": "e2e/**", "on": ["**/*.go", "!**/*_test.go"]}]
+    assert body["always_run"] == ["smoke/**"]
+    assert "4 package(s) depend on changed Go code" in result.stderr
+
+
+@pytest.mark.usefixtures("go_repo")
+def test_go_list_failure_sends_no_dependents(
+    api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sieve.cli.main.run_go_list", lambda root: None)
+    route = api.post(SELECT_URL).respond(json=response())
+
+    result = run()
+
+    assert result.exit_code == 0
+    assert sent(route)["affected_packages"] == {}  # existing fallbacks decide
+    assert "go list -deps -test -json ./...` failed" in result.stderr
+
+
+@pytest.mark.usefixtures("go_repo")
+def test_no_go_list_option(api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch) -> None:
+    def must_not_run(root: Path) -> None:
+        raise AssertionError("go list should not run")
+
+    monkeypatch.setattr("sieve.cli.main.run_go_list", must_not_run)
+    route = api.post(SELECT_URL).respond(json=response())
+
+    run("--no-go-list")
+
+    assert "affected_packages" not in sent(route)
+    assert sent(route)["go_module"] == M
+
+
+def test_go_list_skipped_when_diff_unknown(
+    go_repo: Path, api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sieve.cli.main.run_go_list", lambda root: pytest.fail("ran go list"))
+    route = api.post(SELECT_URL).respond(json=response(mode="full"))
+
+    run("--base", "no-such-branch")
+
+    assert sent(route)["changed_files_known"] is False
+    assert "affected_packages" not in sent(route)
+
+
+@pytest.mark.usefixtures("go_repo")
+def test_invalid_sieve_toml_exits_2(api: respx.MockRouter) -> None:
+    Path(".sieve.toml").write_text('[[depends]]\ntests = "e2e/**"\non = []\n')
+    route = api.post(SELECT_URL).respond(json=response())
+
+    result = run()
+
+    assert result.exit_code == 2
+    assert "needs at least one non-'!' glob" in result.stderr
+    assert not route.called
 
 
 # --- parsing git output -------------------------------------------------------------------

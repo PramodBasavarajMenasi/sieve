@@ -3,12 +3,21 @@
 import json
 import os
 import subprocess
+from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
 import typer
 
 from sieve import __version__
+from sieve.cli.gograph import build_graph, run_go_list
+from sieve.cli.repoconfig import (
+    FILE_NAME,
+    RepoConfig,
+    RepoConfigError,
+    load_repo_config,
+    read_go_module,
+)
 
 app = typer.Typer(help="Sieve: test impact analysis for CI.", no_args_is_help=True)
 
@@ -38,6 +47,10 @@ def select_command(
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the full API response as JSON.")
     ] = False,
+    go_list: Annotated[
+        bool,
+        typer.Option(help="For Go repos, run `go list` to select tests of dependent packages."),
+    ] = True,
 ) -> None:
     """Print the test command for the changes in BASE...HEAD.
 
@@ -50,12 +63,27 @@ def select_command(
         _err("error: set SIEVE_API_TOKEN")
         raise typer.Exit(EXIT_USAGE)
 
+    root = git_toplevel() or Path.cwd()
+    config_path = root / FILE_NAME
+    try:
+        config = load_repo_config(config_path) if config_path.is_file() else RepoConfig()
+    except RepoConfigError as exc:
+        _err(f"error: {exc}")
+        raise typer.Exit(EXIT_USAGE) from exc
+
     changed = git_changed_files(base, head)
-    body = {
+    body: dict[str, Any] = {
         "repo": repo,
         "changed_files": changed or [],
         "changed_files_known": changed is not None,
+        "depends": [{"tests": r.tests, "on": list(r.on)} for r in config.depends],
+        "always_run": list(config.always_run),
     }
+    go_module = read_go_module(root)
+    if go_module:
+        body["go_module"] = go_module
+        if go_list and changed:
+            body["affected_packages"] = go_dependents(root, changed)
     try:
         response = httpx.post(
             f"{server.rstrip('/')}/select",
@@ -85,6 +113,30 @@ def select_command(
         # Never let "run nothing" be mistaken for "run everything".
         _err("error: the full suite is needed, but sieve knows no command for this repo's tests")
         raise typer.Exit(EXIT_FULL_SUITE_NO_COMMAND)
+
+
+def git_toplevel() -> Path | None:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], capture_output=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return Path(proc.stdout.decode(errors="replace").strip())
+
+
+def go_dependents(root: Path, changed: list[str]) -> dict[str, list[str]]:
+    """Packages whose tests import a changed package; empty (fallbacks apply) if go list fails."""
+    packages = run_go_list(root)
+    if packages is None:
+        _err("warning: `go list -deps -test -json ./...` failed; not selecting dependents")
+        return {}
+    affected = build_graph(packages, root).affected(changed)
+    if affected:
+        _err(f"sieve: go list: {len(affected)} package(s) depend on changed Go code")
+    return affected
 
 
 def git_changed_files(base: str, head: str) -> list[str] | None:

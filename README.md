@@ -16,9 +16,42 @@ Open-source test impact analysis for agent-driven CI.
    doesn't change the result.
 3. **Inspect.** `GET /tests/{test_id}/history?repo=` returns a test's stats and its last 20
    results.
+4. **Select.** `sieve select` (or `POST /select`) turns a change into a test command. Each
+   selected test comes with its reasons. It runs the full suite instead whenever it isn't
+   confident: unknown or empty diff, build/CI/dependency files changed, no history, or a
+   changed file nothing covers.
 
-Test selection for a given change is the next milestone. When sieve isn't confident, it will
-fall back to running the full suite.
+## Selecting tests
+
+```sh
+export SIEVE_API_TOKEN=...
+eval "$(sieve select --repo acme/shop --base origin/main --head HEAD --server https://sieve.example)"
+```
+
+The command goes to stdout and a one-line summary to stderr. `--json` prints the full
+response. In CI, fetch enough history for `base...head` (e.g. `fetch-depth: 0`); if the diff
+fails, the full suite runs.
+
+Tests are selected from:
+
+- **The changed files' own tests.** Python `foo.py` selects tests in `test_foo.py`. JS/TS
+  `foo.ts` selects `foo.test.*`, `foo.spec.*` and `__tests__/foo.*`. A changed Go file runs its
+  whole package. A changed test file runs itself.
+- **Go dependents.** In a Go module the CLI runs `go list -deps -test -json ./...` and selects
+  every package whose tests import a changed package, directly or transitively. If `go list`
+  fails, this is skipped; use `--no-go-list` to skip it on purpose.
+- **History.** Tests that failed in earlier runs touching the same files (co-change), and
+  tests that recently failed or are broken on main.
+- **`.sieve.toml`** at the repo root, for dependencies sieve can't see. An example is a test
+  suite that drives a built binary:
+
+  ```toml
+  always_run = ["tests/smoke/**"]
+
+  [[depends]]
+  tests = "test/cli/**"                # test file paths, or <Go package dir>/<TestName>
+  on = ["**/*.go", "!**/*_test.go"]    # ** spans directories; ! excludes
+  ```
 
 Raw results are append-only. All state lives in Postgres, so API workers are stateless. Every
 endpoint except `/healthz` and the API docs requires `Authorization: Bearer $SIEVE_API_TOKEN`.

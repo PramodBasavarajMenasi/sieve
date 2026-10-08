@@ -519,6 +519,86 @@ def test_pull_request_without_a_base_is_unknown(
     assert uploaded_diff(sieve) == ([], False)
 
 
+def fork_pr_run(run_id: int = 1) -> dict[str, Any]:
+    """A fork PR run whose commit GitHub no longer links to its (closed) PR."""
+    return gh_run(
+        run_id,
+        event="pull_request",
+        pull_requests=[],
+        head_branch="master",
+        head_repository={"owner": {"login": "forker"}},
+        run_started_at="2026-09-01T10:00:00Z",
+    )
+
+
+def closed_pr(base: str, head: str, created: str, closed: str | None, number: int) -> Any:
+    return {**pr(base, head=head, number=number), "created_at": created, "closed_at": closed}
+
+
+def test_closed_pr_is_found_by_branch(router: respx.MockRouter, clock: FakeClock) -> None:
+    mock_runs(router, fork_pr_run())
+    standard_run(router, gh_run(1))
+    router.get(f"{GH}/repos/{REPO}/commits/{HEAD}/pulls").respond(json=[])
+    branch_prs = router.get(f"{GH}/repos/{REPO}/pulls").respond(
+        json=[closed_pr(BASE, HEAD, "2026-08-30T00:00:00Z", "2026-09-02T00:00:00Z", 7)]
+    )
+    mock_compare(router, BASE, [{"filename": "closed_pr.go"}])
+    sieve = mock_sieve(router, 201)
+
+    run_backfill(clock)
+
+    params = branch_prs.calls.last.request.url.params
+    assert (params["state"], params["head"]) == ("all", "forker:master")
+    assert uploaded_diff(sieve) == (["closed_pr.go"], True)
+
+
+def test_branch_pr_is_matched_by_time_when_head_moved(
+    router: respx.MockRouter, clock: FakeClock
+) -> None:
+    # The fork's "master" was used by several PRs; the run's commit is no longer any PR's
+    # head (later pushes moved it), so pick the PR that was open when the run started.
+    mock_runs(router, fork_pr_run())
+    standard_run(router, gh_run(1))
+    router.get(f"{GH}/repos/{REPO}/commits/{HEAD}/pulls").respond(json=[])
+    router.get(f"{GH}/repos/{REPO}/pulls").respond(
+        json=[
+            closed_pr("e" * 40, "1" * 40, "2026-09-05T00:00:00Z", None, 9),  # later PR
+            closed_pr(BASE, "2" * 40, "2026-08-30T00:00:00Z", "2026-09-03T00:00:00Z", 8),
+            closed_pr("f" * 40, "3" * 40, "2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z", 5),
+        ]
+    )
+    mock_compare(router, BASE, [{"filename": "pr8.go"}])
+    sieve = mock_sieve(router, 201)
+
+    run_backfill(clock)
+
+    assert uploaded_diff(sieve) == (["pr8.go"], True)
+
+
+@pytest.mark.parametrize(
+    "branch_response",
+    [
+        # Only PRs that weren't open when the run started: too ambiguous to use.
+        httpx.Response(200, json=[closed_pr(BASE, "9" * 40, "2026-09-05T00:00:00Z", None, 9)]),
+        httpx.Response(200, json=[]),
+        httpx.Response(500, json={"message": "boom"}),
+    ],
+    ids=["no-pr-open-at-run-time", "no-prs", "lookup-fails"],
+)
+def test_branch_lookup_without_a_clear_match_is_unknown(
+    router: respx.MockRouter, clock: FakeClock, branch_response: httpx.Response
+) -> None:
+    mock_runs(router, fork_pr_run())
+    standard_run(router, gh_run(1))
+    router.get(f"{GH}/repos/{REPO}/commits/{HEAD}/pulls").respond(json=[])
+    router.get(f"{GH}/repos/{REPO}/pulls").mock(return_value=branch_response)
+    sieve = mock_sieve(router, 201)
+
+    run_backfill(clock, gh={"max_retries": 0})
+
+    assert uploaded_diff(sieve) == ([], False)
+
+
 @pytest.mark.parametrize("event", ["schedule", "workflow_dispatch", "pull_request_target"])
 def test_other_events_have_unknown_diffs(
     router: respx.MockRouter, clock: FakeClock, event: str

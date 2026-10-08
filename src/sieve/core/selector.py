@@ -39,6 +39,7 @@ recently-failed partly cover that. The kubo real-data check measures what is mis
 from __future__ import annotations
 
 import fnmatch
+import functools
 import posixpath
 import re
 import shlex
@@ -125,6 +126,57 @@ class SelectorConfig:
     # Go module path (e.g. "github.com/ipfs/kubo"). When set, Go commands use ./relative
     # package dirs and root-package changes can be mapped; otherwise import paths are used.
     go_module: str | None = None
+    # Declared dependencies from the repo's .sieve.toml.
+    depends: tuple[DependsRule, ...] = ()
+
+
+@dataclass(frozen=True)
+class DependsRule:
+    """``[[depends]]`` in .sieve.toml: tests matching ``tests`` depend on files matching ``on``.
+
+    Globs support ``*`` (within a path segment), ``**`` (any number of segments) and ``?``.
+    Patterns in ``on`` starting with ``!`` exclude files. ``tests`` is matched against a
+    test's file path, or for Go tests ``<package dir>/<TestName>``; it may match a suffix of
+    the Go import path, so ``test/cli/**`` matches ``github.com/ipfs/kubo/test/cli`` tests.
+    """
+
+    tests: str
+    on: tuple[str, ...]
+
+    def matches_file(self, path: str) -> bool:
+        include = [p for p in self.on if not p.startswith("!")]
+        exclude = [p[1:] for p in self.on if p.startswith("!")]
+        return any(glob_match(path, p) for p in include) and not any(
+            glob_match(path, p) for p in exclude
+        )
+
+
+@functools.lru_cache(maxsize=1024)
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def glob_match(path: str, pattern: str) -> bool:
+    """Path glob: ``*`` and ``?`` stay within one segment, ``**`` spans segments."""
+    return _glob_regex(pattern).match(path) is not None
 
 
 @dataclass(frozen=True)
@@ -191,8 +243,15 @@ def select_tests(
     changed_files: Iterable[str],
     changed_files_known: bool,
     config: SelectorConfig | None = None,
+    affected_packages: Mapping[str, Sequence[str]] | None = None,
 ) -> Selection:
+    """Select tests for a change.
+
+    ``affected_packages`` maps a Go package import path to the changed packages it imports
+    (directly or transitively), as computed by the CLI from ``go list -deps -test``.
+    """
     config = config or SelectorConfig()
+    affected_packages = affected_packages or {}
     tests = _index(history.tests.values() if history else ())
 
     def full(reason: str) -> Selection:
@@ -236,6 +295,47 @@ def select_tests(
             add(test_id, reason)
             if path.endswith(".go") and tests[test_id].runner is Runner.GO:
                 whole_packages.add(tests[test_id].classname)
+
+    # Go dependents: packages whose tests import a changed package. They run whole.
+    covered_by_dependents: set[str] = set()  # changed packages imported by a tested package
+    for test in tests.values():
+        imported = affected_packages.get(test.classname) if test.runner is Runner.GO else None
+        if imported:
+            first = sorted(imported)[0]
+            more = f" (+{len(imported) - 1} more)" if len(imported) > 1 else ""
+            add(test.test_id, f"imports changed package {first}{more}")
+            whole_packages.add(test.classname)
+            covered_by_dependents.update(imported)
+
+    # Declared dependencies (.sieve.toml [[depends]]).
+    covered_by_rules: set[str] = set()
+    for rule in config.depends:
+        triggers = [p for p in relevant if rule.matches_file(p)]
+        if not triggers:
+            continue
+        matched = [t for t in tests.values() if _test_matches_glob(t, rule.tests, config)]
+        if not matched:
+            continue
+        covered_by_rules.update(triggers)
+        for test in matched:
+            add(test.test_id, f"declared dependency: {rule.tests} on {_list(triggers, 1)}")
+            if test.runner is Runner.GO:
+                whole_packages.add(test.classname)
+
+    # A changed file is covered if its own tests, its package's dependents' tests or a
+    # declared rule selected something; anything else still forces the full suite.
+    unmapped = [
+        p
+        for p in unmapped
+        if p not in covered_by_rules
+        and not (
+            p.endswith(".go")
+            and any(
+                _go_package_matches(pkg, posixpath.dirname(p), config.go_module)
+                for pkg in covered_by_dependents
+            )
+        )
+    ]
     if unmapped:
         return full(f"changed file maps to no known tests: {_list(unmapped)}")
 
@@ -424,6 +524,18 @@ def _map_path(path: str, tests: Mapping[str, _Test], config: SelectorConfig) -> 
             if t.file_path and _js_test_matches(t.file_path, stem):
                 hits.setdefault(t.test_id, f"{t.file_path} tests changed {path}")
     return hits
+
+
+def _test_matches_glob(test: _Test, pattern: str, config: SelectorConfig) -> bool:
+    """Whether a declared-dependency ``tests`` glob covers ``test``."""
+    if any(path and glob_match(path, pattern) for path in (test.file_path, test.py_path)):
+        return True
+    if test.runner is Runner.GO:
+        # "<import path>/<TestName>", matched at any path-segment suffix so that
+        # "test/cli/**" works with or without go_module: .../kubo/test/cli/TestAdd.
+        parts = f"{test.classname}/{test.name.split('/', 1)[0]}".split("/")
+        return any(glob_match("/".join(parts[i:]), pattern) for i in range(len(parts)))
+    return False
 
 
 def _go_package_matches(package: str, directory: str, module: str | None) -> bool:

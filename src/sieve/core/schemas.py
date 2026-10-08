@@ -66,6 +66,18 @@ class RunLookupResponse(BaseModel):
     commit_sha: str
 
 
+Glob = Annotated[str, StringConstraints(min_length=1, max_length=1024)]
+
+
+class DependsRuleIn(BaseModel):
+    """A ``[[depends]]`` rule from the repo's .sieve.toml."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tests: Glob
+    on: list[Glob] = Field(min_length=1, max_length=100)
+
+
 class SelectRequest(BaseModel):
     """Body of ``POST /select``."""
 
@@ -79,6 +91,14 @@ class SelectRequest(BaseModel):
         default=True,
         description="False if the caller could not determine the diff; forces the full suite.",
     )
+    affected_packages: dict[str, list[str]] = Field(
+        default_factory=dict,
+        max_length=20_000,
+        description="Go package -> changed packages it imports, from `go list -deps -test`",
+    )
+    depends: list[DependsRuleIn] = Field(default_factory=list, max_length=100)
+    always_run: list[Glob] = Field(default_factory=list, max_length=1000)
+    go_module: NonEmpty255 | None = None
 
 
 class SelectedTestOut(BaseModel):
@@ -97,6 +117,9 @@ class SelectResponse(BaseModel):
     total_known: int
     command: str = Field(description="Shell line to run; empty when no tests are affected")
     commands: list[str]
+    go_packages_run_whole: list[str] = Field(
+        description="Go packages run without -run (changed, dependent or declared)"
+    )
     tests: list[SelectedTestOut] = Field(description="Selected tests; empty in full mode")
 
 

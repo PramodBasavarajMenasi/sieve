@@ -103,6 +103,42 @@ def test_selective_response(client: TestClient) -> None:
 
 
 @pytest.mark.usefixtures("seeded")
+def test_affected_packages_and_go_module(client: TestClient) -> None:
+    # pricing has no tests; cart imports it (per go list), so cart's tests run whole.
+    body = post_select(
+        client,
+        changed_files=["pricing/rules.go"],
+        affected_packages={GO_PKG: ["github.com/acme/shop/pricing"]},
+        go_module="github.com/acme/shop",
+    ).json()
+
+    assert body["mode"] == "selective"
+    assert body["commands"] == ["go test ./cart"]
+    assert body["go_packages_run_whole"] == [GO_PKG]
+    assert {t["reason"] for t in body["tests"]} == {
+        "imports changed package github.com/acme/shop/pricing"
+    }
+
+
+@pytest.mark.usefixtures("seeded")
+def test_declared_dependencies_and_always_run(client: TestClient) -> None:
+    body = post_select(
+        client,
+        changed_files=["src/shop/payments.py"],
+        depends=[{"tests": "tests/test_db.py", "on": ["src/shop/**"]}],
+        always_run=["tests.test_cart::test_total"],
+    ).json()
+
+    assert body["mode"] == "selective"
+    assert {t["test_id"]: t["reason"] for t in body["tests"]} == {
+        "tests.test_db::test_query": (
+            "declared dependency: tests/test_db.py on src/shop/payments.py"
+        ),
+        "tests.test_cart::test_total": "always-run pattern 'tests.test_cart::test_total'",
+    }
+
+
+@pytest.mark.usefixtures("seeded")
 def test_docs_only_change_selects_nothing(client: TestClient) -> None:
     body = post_select(client, changed_files=["README.md", "docs/setup.md"]).json()
 
@@ -162,8 +198,24 @@ def test_select_requires_token(client: TestClient) -> None:
         {"repo": REPO, "changed_files_known": "maybe"},
         {"repo": REPO, "unexpected": 1},
         {"repo": REPO, "changed_files": ["x" * 4097]},
+        {"repo": REPO, "depends": [{"tests": "t/**", "on": []}]},
+        {"repo": REPO, "depends": [{"tests": "t/**"}]},
+        {"repo": REPO, "depends": [{"tests": "t/**", "on": ["**"], "extra": 1}]},
+        {"repo": REPO, "affected_packages": {"a": "b"}},
+        {"repo": REPO, "always_run": [""]},
     ],
-    ids=["empty-repo", "files-not-list", "known-not-bool", "extra-field", "path-too-long"],
+    ids=[
+        "empty-repo",
+        "files-not-list",
+        "known-not-bool",
+        "extra-field",
+        "path-too-long",
+        "depends-empty-on",
+        "depends-missing-on",
+        "depends-extra-field",
+        "affected-not-list",
+        "always-run-empty-glob",
+    ],
 )
 def test_invalid_body_returns_422(client: TestClient, body: dict[str, Any]) -> None:
     response = client.post("/select", json=body, headers=AUTH)

@@ -8,6 +8,7 @@ from sieve.core.ingest import create_run
 from sieve.core.junit import ParsedTestResult, Status
 from sieve.core.schemas import RunMetadata
 from sieve.core.selector import (
+    DependsRule,
     FailedRun,
     KnownTest,
     Mode,
@@ -15,6 +16,7 @@ from sieve.core.selector import (
     Runner,
     Selection,
     SelectorConfig,
+    glob_match,
     is_build_file,
     load_history,
     select_for_repo,
@@ -228,6 +230,9 @@ GO = history(
     f"{COREUNIX}::TestAdd/ipfs_add_--to-files",
     f"{KUBO}::TestCommands",
 )
+GO_IN = {
+    package: [t for t in GO.tests if t.startswith(f"{package}::")] for package in (CLI, COREUNIX)
+}
 
 
 def test_go_file_selects_every_test_in_its_package() -> None:
@@ -262,6 +267,126 @@ def test_go_module_makes_package_matching_exact() -> None:
     hist = history(f"{CLI}::TestAdd", f"{KUBO}/cli::TestMain")
     assert len(select(hist, "cli/main.go").tests) == 2
     assert ids(select(hist, "cli/main.go", go_module=KUBO)) == [f"{KUBO}/cli::TestMain"]
+
+
+# --- Go dependents (affected_packages from go list) ---------------------------------------
+
+COREAPI = f"{KUBO}/core/coreapi"  # a package with no tests of its own
+
+
+def test_dependents_are_selected_and_run_whole() -> None:
+    selection = select_tests(
+        GO,
+        ["core/coreapi/api.go"],
+        True,
+        SelectorConfig(go_module=KUBO),
+        affected_packages={COREUNIX: [COREAPI], CLI: [COREAPI, f"{KUBO}/config"]},
+    )
+
+    # coreapi has no tests, but its importers do, so this is not a full-suite fallback.
+    assert selection.mode is Mode.SELECTIVE
+    assert reasons(selection)[f"{COREUNIX}::TestAdd"] == f"imports changed package {COREAPI}"
+    # Several changed imports: the first (sorted) is named.
+    assert (
+        reasons(selection)[f"{CLI}::TestAdd"] == f"imports changed package {KUBO}/config (+1 more)"
+    )
+    assert selection.commands == ("go test ./core/coreunix", "go test ./test/cli")
+    assert selection.go_packages_run_whole == (COREUNIX, CLI)
+
+
+def test_dependents_without_known_tests_do_not_cover_a_change() -> None:
+    selection = select_tests(
+        GO,
+        ["core/coreapi/api.go"],
+        True,
+        SelectorConfig(go_module=KUBO),
+        affected_packages={f"{KUBO}/core/untested": [COREAPI]},
+    )
+    assert selection.reason == "changed file maps to no known tests: core/coreapi/api.go"
+
+
+def test_dependents_only_cover_the_packages_they_import() -> None:
+    # coreunix imports coreapi, but nothing covers the change in ./plugin.
+    selection = select_tests(
+        GO,
+        ["core/coreapi/api.go", "plugin/loader.go"],
+        True,
+        SelectorConfig(go_module=KUBO),
+        affected_packages={COREUNIX: [COREAPI]},
+    )
+    assert selection.reason == "changed file maps to no known tests: plugin/loader.go"
+
+
+# --- declared dependencies (.sieve.toml) --------------------------------------------------
+
+CLI_ON_GO = DependsRule("test/cli/**", ("**/*.go", "!**/*_test.go"))
+
+
+@pytest.mark.parametrize(
+    ("path", "pattern", "expected"),
+    [
+        ("core/coreapi/api.go", "**/*.go", True),
+        ("version.go", "**/*.go", True),  # ** matches zero directories
+        ("core/coreapi/api.go", "*.go", False),  # * stays within one segment
+        ("core/api_test.go", "**/*_test.go", True),
+        ("src/a/b/c.py", "src/**", True),
+        ("src", "src/**", False),
+        ("docs/a.md", "docs/?.md", True),
+        ("test/cli/TestAdd", "test/cli/**", True),
+        ("test/clix/TestAdd", "test/cli/**", False),
+    ],
+)
+def test_glob_match(path: str, pattern: str, expected: bool) -> None:
+    assert glob_match(path, pattern) is expected
+
+
+def test_depends_rule_negation() -> None:
+    assert CLI_ON_GO.matches_file("core/coreapi/api.go")
+    assert not CLI_ON_GO.matches_file("core/coreapi/api_test.go")
+    assert not CLI_ON_GO.matches_file("docs/config.md")
+
+
+@pytest.mark.parametrize("go_module", [KUBO, None])
+def test_declared_dependency_selects_binary_level_suite(go_module: str | None) -> None:
+    # Works with or without go_module: "test/cli/**" matches a suffix of the import path.
+    selection = select(GO, "core/coreunix/add.go", depends=(CLI_ON_GO,), go_module=go_module)
+
+    assert set(ids(selection)) == {*GO_IN[COREUNIX], *GO_IN[CLI]}
+    assert reasons(selection)[f"{CLI}::TestAdd"] == (
+        "declared dependency: test/cli/** on core/coreunix/add.go"
+    )
+    assert selection.go_packages_run_whole == (COREUNIX, CLI)
+
+
+def test_declared_dependency_covers_a_package_without_tests() -> None:
+    selection = select(GO, "core/coreapi/api.go", depends=(CLI_ON_GO,), go_module=KUBO)
+
+    assert selection.mode is Mode.SELECTIVE
+    assert set(ids(selection)) == set(GO_IN[CLI])
+    assert selection.commands == ("go test ./test/cli",)
+
+
+def test_declared_dependency_respects_exclusions() -> None:
+    selection = select(GO, "core/coreunix/add_test.go", depends=(CLI_ON_GO,), go_module=KUBO)
+    assert set(ids(selection)) == set(GO_IN[COREUNIX])  # test-only change: not test/cli
+
+
+def test_declared_dependency_matching_no_tests_does_not_cover() -> None:
+    rule = DependsRule("e2e/**", ("**/*.go",))
+    selection = select(GO, "core/coreapi/api.go", depends=(rule,), go_module=KUBO)
+    assert selection.mode is Mode.FULL
+
+
+def test_declared_dependency_for_python_file_paths() -> None:
+    hist = history(
+        ("tests.integration.test_api::test_flow", "tests/integration/test_api.py"),
+        *PY.tests.values(),
+    )
+    rule = DependsRule("tests/integration/**", ("src/**",))
+    selection = select(hist, "src/shop/helpers.py", depends=(rule,))
+
+    assert ids(selection) == ["tests.integration.test_api::test_flow"]
+    assert selection.commands == ("pytest tests/integration/test_api.py::test_flow",)
 
 
 # --- path mapping: JS/TS ------------------------------------------------------------------

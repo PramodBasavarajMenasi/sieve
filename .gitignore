@@ -12,3 +12,4 @@ coverage.xml
 htmlcov/
 .env
 CLAUDE.md
+.eval-cache/

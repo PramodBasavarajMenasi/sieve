@@ -214,26 +214,47 @@ class GitHubClient:
         return [], False
 
     def _pull_request_base(self, repo: str, run: Json) -> str | None:
+        """The base sha of the PR this run tested, or None if no PR can be identified.
+
+        Sources, in order: the run's ``pull_requests`` (empty for fork PRs), the
+        commit-to-PR lookup (only finds open PRs for commits not on the default branch),
+        then the repo's PR list filtered by head owner and branch, including closed PRs.
+        """
         head = run["head_sha"]
-        candidates: list[Json] = run.get("pull_requests") or []
-        if not candidates:
-            # GitHub leaves pull_requests empty for PRs from forks; ask which PRs have this commit.
-            try:
-                response = self.get(f"/repos/{repo}/commits/{head}/pulls")
-                response.raise_for_status()
-                data = response.json()
-            except (httpx.HTTPError, ValueError) as exc:
-                _warn(f"could not look up pull requests for {head[:7]}: {exc}")
-                return None
-            candidates = (
-                [pr for pr in data if isinstance(pr, dict)] if isinstance(data, list) else []
+        # GitHub links these PRs to the run or commit, so any of them will do as a fallback.
+        linked: list[Json] = run.get("pull_requests") or []
+        if not linked:
+            linked = self._list_json(f"/repos/{repo}/commits/{head}/pulls") or []
+        if linked:
+            pr: Json | None = _pick_pull_request(linked, run) or linked[0]
+        else:
+            # Same branch name can belong to unrelated PRs: only accept a clear match.
+            pr = _pick_pull_request(self._pull_requests_for_branch(repo, run), run)
+        sha = pr.get("base", {}).get("sha") if pr else None
+        return str(sha) if sha else None
+
+    def _pull_requests_for_branch(self, repo: str, run: Json) -> list[Json]:
+        owner = (run.get("head_repository") or {}).get("owner", {}).get("login")
+        branch = run.get("head_branch")
+        if not owner or not branch:
+            return []
+        return (
+            self._list_json(
+                f"/repos/{repo}/pulls", state="all", head=f"{owner}:{branch}", per_page=PER_PAGE
             )
-        matching = [pr for pr in candidates if pr.get("head", {}).get("sha") == head]
-        for pr in matching or candidates:
-            sha = pr.get("base", {}).get("sha")
-            if sha:
-                return str(sha)
-        return None
+            or []
+        )
+
+    def _list_json(self, url: str, **params: Any) -> list[Json] | None:
+        """A JSON array endpoint's objects, or None (with a warning) if the call fails."""
+        try:
+            response = self.get(url, **params)
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            _warn(f"could not get {url}: {exc}")
+            return None
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else None
 
     def _push_before(self, repo: str, run: Json) -> str | None:
         """The push's ``before`` sha (from the run's check suite), if it is a usable base."""
@@ -410,6 +431,25 @@ def run_metadata(
         "changed_files": changed_files,
         "changed_files_known": changed_files_known,
     }
+
+
+def _pick_pull_request(candidates: list[Json], run: Json) -> Json | None:
+    """The PR a run tested: the one whose head is the run's commit, else the one that was
+    open when the run started (a branch name like a fork's ``master`` can be reused by many
+    PRs over time). None if neither applies."""
+    head = run["head_sha"]
+    for pr in candidates:
+        if pr.get("head", {}).get("sha") == head:
+            return pr
+    started = run.get("run_started_at") or run.get("created_at")
+    if not started:
+        return None
+    for pr in candidates:
+        created, closed = pr.get("created_at"), pr.get("closed_at")
+        # ISO-8601 UTC timestamps from the same API compare correctly as strings.
+        if created and created <= started and (closed is None or started <= closed):
+            return pr
+    return None
 
 
 def _attempt(run: Json) -> int:

@@ -16,6 +16,7 @@ from sieve.core.selector import (
     Runner,
     Selection,
     SelectorConfig,
+    build_file_scope,
     glob_match,
     is_build_file,
     load_history,
@@ -96,7 +97,8 @@ def test_empty_changed_files_run_the_full_suite(changed: tuple[str, ...]) -> Non
         "requirements-dev.txt",
         "tests/conftest.py",
         "package.json",
-        "web/package-lock.json",
+        "package-lock.json",
+        "web/tsconfig.json",  # nested, but not a project manifest: still global
         "yarn.lock",
         "pnpm-lock.yaml",
         "tsconfig.build.json",
@@ -387,6 +389,89 @@ def test_declared_dependency_for_python_file_paths() -> None:
 
     assert ids(selection) == ["tests.integration.test_api::test_flow"]
     assert selection.commands == ("pytest tests/integration/test_api.py::test_flow",)
+
+
+# --- nested build files -------------------------------------------------------------------
+
+EXAMPLE = f"{KUBO}/docs/examples/kubo-as-a-library"  # a nested Go module
+NESTED = history(
+    *GO.tests.values(),
+    f"{EXAMPLE}::TestLibrary",
+    ("api.tests.test_routes::test_get", "services/api/tests/test_routes.py"),
+    ("cart::adds", "web/src/cart.test.ts"),
+    ("admin cart::adds", "web2/src/cart.test.ts"),
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "scope"),
+    [
+        ("docs/examples/kubo-as-a-library/go.mod", "docs/examples/kubo-as-a-library"),
+        ("docs/examples/kubo-as-a-library/go.sum", "docs/examples/kubo-as-a-library"),
+        ("web/package.json", "web"),
+        ("web/yarn.lock", "web"),
+        ("services/api/pyproject.toml", "services/api"),
+        ("services/api/requirements-dev.txt", "services/api"),
+        ("go.mod", None),  # root: whole repo
+        ("package.json", None),
+        ("pyproject.toml", None),
+        ("docker/Dockerfile.dev", None),  # not a project manifest
+        ("tests/conftest.py", None),
+        ("src/cart.py", None),
+    ],
+)
+def test_build_file_scope(path: str, scope: str | None) -> None:
+    assert build_file_scope(path) == scope
+
+
+def test_nested_go_module_runs_only_its_own_tests() -> None:
+    selection = select(
+        NESTED,
+        "docs/examples/kubo-as-a-library/go.mod",
+        "docs/examples/kubo-as-a-library/go.sum",
+        go_module=KUBO,
+    )
+
+    assert selection.mode is Mode.SELECTIVE
+    assert ids(selection) == [f"{EXAMPLE}::TestLibrary"]
+    assert reasons(selection)[f"{EXAMPLE}::TestLibrary"] == (
+        "build file docs/examples/kubo-as-a-library/go.mod changed "
+        "(tests under docs/examples/kubo-as-a-library/); "
+        "build file docs/examples/kubo-as-a-library/go.sum changed "
+        "(tests under docs/examples/kubo-as-a-library/)"
+    )
+    assert selection.go_packages_run_whole == (EXAMPLE,)
+    assert selection.commands == ("go test ./docs/examples/kubo-as-a-library",)
+
+
+def test_nested_build_file_without_known_tests_does_not_force_full() -> None:
+    selection = select(GO, "docs/examples/kubo-as-a-library/go.mod", go_module=KUBO)
+
+    assert selection.mode is Mode.SELECTIVE
+    assert selection.reason == "no tests affected"
+
+
+def test_nested_build_file_combines_with_other_changes() -> None:
+    selection = select(NESTED, "web/package.json", "core/coreunix/add.go", go_module=KUBO)
+
+    assert set(ids(selection)) == {"cart::adds", *GO_IN[COREUNIX]}
+    assert "admin cart::adds" not in ids(selection)  # web2/ is not under web/
+    assert reasons(selection)["cart::adds"] == (
+        "build file web/package.json changed (tests under web/)"
+    )
+
+
+def test_nested_python_project() -> None:
+    selection = select(NESTED, "services/api/pyproject.toml")
+    assert ids(selection) == ["api.tests.test_routes::test_get"]
+
+
+@pytest.mark.parametrize("root_file", ["go.mod", "go.sum", "package.json", "pyproject.toml"])
+def test_root_build_file_still_forces_full_suite(root_file: str) -> None:
+    selection = select(NESTED, "docs/examples/kubo-as-a-library/go.mod", root_file)
+
+    assert selection.mode is Mode.FULL
+    assert selection.reason == f"build/config file changed: {root_file}"
 
 
 # --- path mapping: JS/TS ------------------------------------------------------------------

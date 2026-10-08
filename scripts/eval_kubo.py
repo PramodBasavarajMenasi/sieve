@@ -58,6 +58,7 @@ from sieve.core.selector import (
     Runner,
     Selection,
     SelectorConfig,
+    build_file_scope,
     is_build_file,
     is_ignorable,
     select_tests,
@@ -468,7 +469,7 @@ def counterfactual(
     mapped = [
         p
         for p in changed
-        if not is_build_file(p)
+        if (not is_build_file(p) or build_file_scope(p) is not None)
         and not is_ignorable(p)
         and select_tests(history, [p], True, config, affected).mode is Mode.SELECTIVE
     ]

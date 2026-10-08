@@ -8,7 +8,9 @@ Missing a real failure is worse than running extra tests, so whenever the select
 it returns ``Mode.FULL`` with a reason. It falls back to the full suite when:
 
 * the changed files are unknown, or the list is empty;
-* a build, dependency, CI or test-config file changed;
+* a build, dependency, CI or test-config file changed. A project manifest or lockfile in a
+  subdirectory (``go.mod``, ``package.json``, ``pyproject.toml``, ...) is the exception: it
+  belongs to a nested project, so it selects the tests under its own directory instead;
 * the repo has no test history;
 * any changed source file maps to no known test (non-code files like docs are ignored);
 * a selected test has no known runner, so no command can be built for it.
@@ -97,6 +99,20 @@ _BUILD_GLOBS = (
     "vitest.config.*",
 )  # fmt: skip
 _BUILD_DIRS = (".github/workflows/", ".github/actions/")
+
+# Project manifests and their lockfiles. At the repo root they force the full suite; in a
+# subdirectory they belong to a nested project (an example module, a sub-package) and only
+# affect tests under that directory.
+_SCOPED_BUILD_BASENAMES = frozenset(
+    {
+        "go.mod", "go.sum", "go.work", "go.work.sum",
+        "package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+        "pnpm-lock.yaml", "bun.lock", "bun.lockb",
+        "pyproject.toml", "setup.py", "setup.cfg", "poetry.lock", "uv.lock", "pdm.lock",
+        "Pipfile", "Pipfile.lock",
+    }
+)  # fmt: skip
+_SCOPED_BUILD_GLOBS = ("requirements*.txt",)
 
 # Files that cannot affect test outcomes. They never trigger the full suite on their own.
 _IGNORABLE_EXTENSIONS = frozenset(
@@ -270,7 +286,8 @@ def select_tests(
     paths = sorted({p for p in (normalize_path(f) for f in changed_files) if p})
     if not paths:
         return full("no changed files were given")
-    build = [p for p in paths if is_build_file(p)]
+    scoped_build = {p: d for p in paths if (d := build_file_scope(p)) is not None}
+    build = [p for p in paths if is_build_file(p) and p not in scoped_build]
     if build:
         return full(f"build/config file changed: {_list(build)}")
     if history is None or not tests:
@@ -284,7 +301,7 @@ def select_tests(
             reasons.append(reason)
 
     # Path mapping. Every changed source file must map to at least one test.
-    relevant = [p for p in paths if not is_ignorable(p)]
+    relevant = [p for p in paths if not is_ignorable(p) and p not in scoped_build]
     unmapped = []
     whole_packages: set[str] = set()
     for path in relevant:
@@ -295,6 +312,15 @@ def select_tests(
             add(test_id, reason)
             if path.endswith(".go") and tests[test_id].runner is Runner.GO:
                 whole_packages.add(tests[test_id].classname)
+
+    # Nested manifests/lockfiles: every known test under their directory runs (Go packages
+    # whole). They never force the full suite, even when no known tests live there.
+    for path, directory in sorted(scoped_build.items()):
+        for test in tests.values():
+            if _test_under_dir(test, directory):
+                add(test.test_id, f"build file {path} changed (tests under {directory}/)")
+                if test.runner is Runner.GO:
+                    whole_packages.add(test.classname)
 
     # Go dependents: packages whose tests import a changed package. They run whole.
     covered_by_dependents: set[str] = set()  # changed packages imported by a tested package
@@ -400,6 +426,20 @@ def is_build_file(path: str) -> bool:
         or any(fnmatch.fnmatchcase(base, glob) for glob in _BUILD_GLOBS)
         or path.startswith(_BUILD_DIRS)
     )
+
+
+def build_file_scope(path: str) -> str | None:
+    """The directory a nested project manifest or lockfile is scoped to.
+
+    None for everything else, including root manifests: those affect the whole repo.
+    """
+    directory, base = posixpath.split(path)
+    if directory and (
+        base in _SCOPED_BUILD_BASENAMES
+        or any(fnmatch.fnmatchcase(base, glob) for glob in _SCOPED_BUILD_GLOBS)
+    ):
+        return directory
+    return None
 
 
 def is_ignorable(path: str) -> bool:
@@ -524,6 +564,15 @@ def _map_path(path: str, tests: Mapping[str, _Test], config: SelectorConfig) -> 
             if t.file_path and _js_test_matches(t.file_path, stem):
                 hits.setdefault(t.test_id, f"{t.file_path} tests changed {path}")
     return hits
+
+
+def _test_under_dir(test: _Test, directory: str) -> bool:
+    prefix = directory + "/"
+    if any(path and path.startswith(prefix) for path in (test.file_path, test.py_path)):
+        return True
+    # Go: the package's import path contains the directory, e.g. a nested module
+    # github.com/ipfs/kubo/docs/examples/kubo-as-a-library for docs/examples/kubo-as-a-library.
+    return test.runner is Runner.GO and f"/{directory}/" in f"/{test.classname}/"
 
 
 def _test_matches_glob(test: _Test, pattern: str, config: SelectorConfig) -> bool:

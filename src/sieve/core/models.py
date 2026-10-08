@@ -19,10 +19,11 @@ from sqlalchemy import (
     String,
     Text,
     TypeDecorator,
-    UniqueConstraint,
     func,
+    text,
     true,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, column_property, mapped_column
 
@@ -37,6 +38,8 @@ NAMING_CONVENTION = {
     "pk": "pk_%(table_name)s",
 }
 
+
+RUN_UNIQUE_INDEX = "uq_runs_repo_ci_run_attempt_variant"
 
 MESSAGE_MAX_BYTES = 4096
 TRUNCATION_MARKER = "…[truncated]"
@@ -86,8 +89,16 @@ class Run(Base):
     __table_args__ = (
         Index(None, "repo_id", "commit_sha"),
         Index(None, "repo_id", "is_main", "created_at"),
-        # Idempotent ingest key. NULL ci_run_id never conflicts (Postgres NULLs are distinct).
-        UniqueConstraint("repo_id", "ci_run_id", "run_attempt"),
+        # Idempotent ingest key, one row per matrix variant. NULL variants dedupe with each
+        # other via COALESCE; a NULL ci_run_id never conflicts (Postgres NULLs are distinct).
+        Index(
+            RUN_UNIQUE_INDEX,
+            "repo_id",
+            "ci_run_id",
+            "run_attempt",
+            text("COALESCE(variant, '')"),
+            unique=True,
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -97,6 +108,8 @@ class Run(Base):
     is_main: Mapped[bool] = mapped_column(Boolean)
     ci_run_id: Mapped[str | None] = mapped_column(String(255))
     run_attempt: Mapped[int] = mapped_column(Integer, server_default="1")
+    # Matrix leg of the CI run (e.g. "ubuntu-py3.12"); one row per variant. NULL = no matrix.
+    variant: Mapped[str | None] = mapped_column(String(255))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # False when the uploader could not determine the diff (so changed_files is incomplete or
@@ -150,5 +163,9 @@ class TestStats(Base):
     failures: Mapped[int] = mapped_column(Integer, server_default="0")
     last_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     flaky_score: Mapped[float] = mapped_column(Float, server_default="0")
+    # Earliest start of a current failing streak on main, across variants.
     broken_on_main_since_sha: Mapped[str | None] = mapped_column(String(64))
     avg_duration_ms: Mapped[float | None] = mapped_column(Float)
+    # Which variants are broken on main: [{"variant": str | None, "since_sha": str}], oldest
+    # streak first. NULL when not broken on any variant.
+    broken_on_main_variants: Mapped[list[dict[str, str | None]] | None] = mapped_column(JSONB)

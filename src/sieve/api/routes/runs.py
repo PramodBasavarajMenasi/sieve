@@ -36,19 +36,23 @@ def lookup_run(
     repo: Annotated[str, Query(min_length=1)],
     ci_run_id: Annotated[str, Query(min_length=1)],
     run_attempt: Annotated[int, Query(ge=1)] = 1,
+    variant: Annotated[str | None, Query(max_length=255)] = None,
 ) -> RunLookupResponse:
-    """Whether a CI run attempt is already ingested, so uploaders can skip the work."""
-    run = find_run(session, repo, ci_run_id, run_attempt)
+    """Whether a CI run attempt (and matrix variant) is already ingested, so uploaders can
+    skip the work. Omit ``variant`` for runs uploaded without one."""
+    variant = (variant.strip() or None) if variant is not None else None
+    run = find_run(session, repo, ci_run_id, run_attempt, variant)
     if run is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
-            f"no run {ci_run_id} attempt {run_attempt} recorded for {repo!r}",
+            f"no run {ci_run_id} attempt {run_attempt}{_variant(variant)} recorded for {repo!r}",
         )
     return RunLookupResponse(
         run_id=run.id,
         repo=repo,
         ci_run_id=ci_run_id,
         run_attempt=run_attempt,
+        variant=run.variant,
         commit_sha=run.commit_sha,
     )
 
@@ -95,8 +99,9 @@ def post_run(
             # Same CI run attempt claiming a different commit is a client bug, not a re-upload.
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"run {meta.ci_run_id} attempt {meta.run_attempt} of {meta.repo} is already "
-                f"recorded for commit {run.commit_sha}, not {meta.commit_sha}",
+                f"run {meta.ci_run_id} attempt {meta.run_attempt}{_variant(meta.variant)} "
+                f"of {meta.repo} is already recorded for commit {run.commit_sha}, "
+                f"not {meta.commit_sha}",
             )
         response.status_code = status.HTTP_200_OK
     return RunResponse(
@@ -126,3 +131,7 @@ def _parse_files(files: list[UploadFile]) -> list[ParsedTestResult]:
             seen[result.test_id] = max(seen[result.test_id], result.attempt)
             results.append(result)
     return results
+
+
+def _variant(variant: str | None) -> str:
+    return f" variant {variant!r}" if variant else ""

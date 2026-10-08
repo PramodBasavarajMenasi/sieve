@@ -43,6 +43,7 @@ def get_test_history(
                 is_main=run.is_main,
                 ci_run_id=run.ci_run_id,
                 run_attempt=run.run_attempt,
+                variant=run.variant,
                 occurred_at=run.occurred_at,
                 status=result.status,
                 attempt=result.attempt,

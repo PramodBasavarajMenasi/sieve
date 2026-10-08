@@ -296,6 +296,7 @@ def test_lookup_finds_ingested_run(client: TestClient) -> None:
         "repo": "acme/shop",
         "ci_run_id": "9001",
         "run_attempt": 2,
+        "variant": None,
         "commit_sha": SHA,
     }
 
@@ -330,6 +331,82 @@ def test_lookup_validates_params(client: TestClient, params: dict[str, Any]) -> 
 def test_lookup_requires_token(client: TestClient) -> None:
     response = client.get("/runs/lookup", params={"repo": "acme/shop", "ci_run_id": "1"})
     assert response.status_code == 401
+
+
+# --- matrix variants ----------------------------------------------------------------------
+
+
+def test_each_variant_is_its_own_run(client: TestClient, db_session: Session) -> None:
+    linux = post_run(client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12"))
+    macos = post_run(client, [fixture("go.xml")], metadata(variant="macos-py3.12"))
+    plain = post_run(client, [fixture("go.xml")], metadata())
+
+    assert (linux.status_code, macos.status_code, plain.status_code) == (201, 201, 201)
+    assert len({linux.json()["run_id"], macos.json()["run_id"], plain.json()["run_id"]}) == 3
+    assert count(db_session, Run) == 3
+
+
+def test_reupload_of_one_variant_does_not_block_others(
+    client: TestClient, db_session: Session
+) -> None:
+    first = post_run(client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12"))
+    again = post_run(client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12"))
+    other = post_run(client, [fixture("go.xml")], metadata(variant="macos-py3.12"))
+
+    assert (first.status_code, again.status_code, other.status_code) == (201, 200, 201)
+    assert again.json()["run_id"] == first.json()["run_id"]
+    assert count(db_session, Run) == 2
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_variant_means_no_variant(client: TestClient, blank: str) -> None:
+    first = post_run(client, [fixture("go.xml")], metadata())
+    again = post_run(client, [fixture("go.xml")], metadata(variant=blank))
+
+    assert again.status_code == 200
+    assert again.json()["run_id"] == first.json()["run_id"]
+
+
+def test_concurrent_duplicate_of_a_variant_returns_existing_run(
+    client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = post_run(client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12"))
+    monkeypatch.setattr("sieve.api.routes.runs.find_existing_run", lambda session, meta: None)
+
+    second = post_run(client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12"))
+
+    assert second.status_code == 200
+    assert second.json()["run_id"] == first.json()["run_id"]
+    assert count(db_session, Run) == 1
+
+
+def test_variant_conflict_names_the_variant(client: TestClient) -> None:
+    post_run(client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12"))
+    response = post_run(
+        client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12", commit_sha=OTHER_SHA)
+    )
+    assert response.status_code == 409
+    assert "variant 'ubuntu-py3.12'" in response.json()["detail"]
+
+
+def test_lookup_by_variant(client: TestClient) -> None:
+    linux = post_run(client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12")).json()
+
+    found = lookup(client, variant="ubuntu-py3.12")
+    assert found.status_code == 200
+    assert (found.json()["run_id"], found.json()["variant"]) == (linux["run_id"], "ubuntu-py3.12")
+
+    missing = lookup(client, variant="macos-py3.12")
+    assert missing.status_code == 404
+    assert "variant 'macos-py3.12'" in missing.json()["detail"]
+    # Without a variant, only a run uploaded without one matches.
+    assert lookup(client).status_code == 404
+    assert lookup(client, variant="").status_code == 404
+
+
+def test_variant_too_long_returns_422(client: TestClient) -> None:
+    response = post_run(client, [fixture("go.xml")], metadata(variant="x" * 256))
+    assert response.status_code == 422
 
 
 # --- auth ---------------------------------------------------------------------------------

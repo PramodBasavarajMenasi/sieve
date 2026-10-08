@@ -79,6 +79,8 @@ class TargetRun:
     # None: unknown diff. For PR mode this comes from the DB; for --replay-main from GitHub.
     changed_files: tuple[str, ...] | None = None
     diff_label: str = ""
+    # Every stored run (one per matrix variant) of this CI run attempt; run_id is the first.
+    run_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,7 +120,7 @@ class Result:
 # Runs of the repo strictly before (:at, :run_id). Every history query starts from this.
 _PRIOR = """
 prior AS (
-    SELECT id, commit_sha, is_main, changed_files_known,
+    SELECT id, commit_sha, is_main, changed_files_known, variant,
            COALESCE(started_at, created_at) AS run_at
     FROM runs
     WHERE repo_id = :repo_id
@@ -194,13 +196,18 @@ def history_before(
 
 
 def broken_on_main_before(session: Session, params: dict[str, Any]) -> dict[str, str]:
-    """Same definition as core/history.py, computed from main runs before the cutoff only."""
+    """Same definition as core/history.py, computed from main runs before the cutoff only.
+
+    Per variant: a test is broken if any variant's latest main outcome is a failure; the sha
+    is the earliest streak start across broken variants.
+    """
     rows = session.execute(
         text(
             f"""
             WITH {_PRIOR}
             SELECT DISTINCT ON (tr.test_id, prior.id)
-                   tr.test_id, prior.id, prior.run_at, prior.commit_sha, tr.status
+                   tr.test_id, COALESCE(prior.variant, ''), prior.id, prior.run_at,
+                   prior.commit_sha, tr.status
             FROM prior JOIN test_results tr ON tr.run_id = prior.id
             WHERE prior.is_main
             ORDER BY tr.test_id, prior.id, tr.attempt DESC, tr.id DESC
@@ -208,21 +215,21 @@ def broken_on_main_before(session: Session, params: dict[str, Any]) -> dict[str,
         ),
         params,
     ).all()
-    outcomes: dict[str, list[tuple[datetime, int, str, str]]] = defaultdict(list)
-    for test_id, run_id, run_at, sha, status in rows:
+    outcomes: dict[tuple[str, str], list[tuple[datetime, int, str, str]]] = defaultdict(list)
+    for test_id, variant, run_id, run_at, sha, status in rows:
         if status != "skipped":
-            outcomes[test_id].append((run_at, run_id, sha, status))
-    broken: dict[str, str] = {}
-    for test_id, history in outcomes.items():
+            outcomes[(test_id, variant)].append((run_at, run_id, sha, status))
+    starts: dict[str, tuple[datetime, int, str]] = {}
+    for (test_id, _), history in outcomes.items():
         history.sort(reverse=True)  # newest first
         streak_start = None
-        for _, _, sha, status in history:
+        for run_at, run_id, sha, status in history:
             if status not in FAILED:
                 break
-            streak_start = sha
-        if streak_start is not None:
-            broken[test_id] = streak_start
-    return broken
+            streak_start = (run_at, run_id, sha)
+        if streak_start is not None and (test_id not in starts or streak_start < starts[test_id]):
+            starts[test_id] = streak_start
+    return {test_id: start[2] for test_id, start in starts.items()}
 
 
 def changed_files_of(session: Session, run_ids: list[int]) -> dict[int, set[str]]:
@@ -236,17 +243,18 @@ def changed_files_of(session: Session, run_ids: list[int]) -> dict[int, set[str]
     return changed
 
 
-def actual_failures(session: Session, run_id: int) -> list[str]:
+def actual_failures(session: Session, run_ids: list[int]) -> list[str]:
+    """Tests whose final attempt failed in any of these runs (any variant of a CI run)."""
     rows = session.execute(
         text(
             """
-            SELECT test_id FROM (
-                SELECT DISTINCT ON (test_id) test_id, status FROM test_results
-                WHERE run_id = :run_id ORDER BY test_id, attempt DESC, id DESC
+            SELECT DISTINCT test_id FROM (
+                SELECT DISTINCT ON (run_id, test_id) test_id, status FROM test_results
+                WHERE run_id = ANY(:run_ids) ORDER BY run_id, test_id, attempt DESC, id DESC
             ) final WHERE status IN ('failed', 'error') ORDER BY test_id
             """
         ),
-        {"run_id": run_id},
+        {"run_ids": run_ids},
     ).all()
     return [row[0] for row in rows]
 
@@ -266,21 +274,28 @@ def top_level_durations(session: Session, repo_id: int) -> dict[str, float]:
 # --- targets ------------------------------------------------------------------------------
 
 
+# One row per CI run attempt: its variants (matrix legs) are grouped together. Runs without
+# a CI id stand alone. run_at/id are the earliest, so history cutoffs exclude every variant.
+_CI_RUNS = """
+SELECT min(r.id) AS id, r.ci_run_id, r.commit_sha, r.branch,
+       min(COALESCE(r.started_at, r.created_at)) AS run_at,
+       array_agg(r.id ORDER BY r.id) AS run_ids
+FROM runs r
+WHERE r.repo_id = :repo_id AND {where}
+GROUP BY COALESCE(r.ci_run_id, r.id::text), r.run_attempt, r.ci_run_id, r.commit_sha, r.branch
+{having}
+"""
+
+
 def pr_targets(session: Session, repo_id: int, limit: int, failing: bool) -> list[TargetRun]:
+    query = _CI_RUNS.format(
+        where="NOT r.is_main AND r.changed_files_known",
+        having="""HAVING NOT :failing OR bool_or(EXISTS (
+            SELECT 1 FROM test_results tr
+            WHERE tr.run_id = r.id AND tr.status IN ('failed', 'error')))""",
+    )
     rows = session.execute(
-        text(
-            """
-            SELECT r.id, r.ci_run_id, r.commit_sha, r.branch,
-                   COALESCE(r.started_at, r.created_at) AS run_at
-            FROM runs r
-            WHERE r.repo_id = :repo_id AND NOT r.is_main AND r.changed_files_known
-              AND (NOT :failing OR EXISTS (
-                  SELECT 1 FROM test_results tr
-                  WHERE tr.run_id = r.id AND tr.status IN ('failed', 'error')))
-            ORDER BY run_at DESC, r.id DESC
-            LIMIT :limit
-            """
-        ),
+        text(f"{query} ORDER BY run_at DESC, id DESC LIMIT :limit"),
         {"repo_id": repo_id, "limit": limit, "failing": failing},
     ).all()
     changed = changed_files_of(session, [row[0] for row in rows])
@@ -289,8 +304,9 @@ def pr_targets(session: Session, repo_id: int, limit: int, failing: bool) -> lis
             run_id, ci_run_id, sha, branch, run_at,
             changed_files=tuple(sorted(changed.get(run_id, ()))),
             diff_label="PR diff",
+            run_ids=tuple(run_ids),
         )
-        for run_id, ci_run_id, sha, branch, run_at in rows
+        for run_id, ci_run_id, sha, branch, run_at, run_ids in rows
     ]  # fmt: skip
 
 
@@ -298,26 +314,26 @@ def main_replay_targets(
     session: Session, repo_id: int, repo: str, compare: GitHubCompare
 ) -> list[TargetRun]:
     """Every main run but the first, as a PR from the previous main run's commit."""
-    rows = session.execute(
-        text(
-            """
-            SELECT r.id, r.ci_run_id, r.commit_sha, r.branch,
-                   COALESCE(r.started_at, r.created_at) AS run_at
-            FROM runs r WHERE r.repo_id = :repo_id AND r.is_main
-            ORDER BY run_at, r.id
-            """
-        ),
-        {"repo_id": repo_id},
-    ).all()
+    query = _CI_RUNS.format(where="r.is_main", having="")
+    rows = session.execute(text(f"{query} ORDER BY run_at, id"), {"repo_id": repo_id}).all()
     targets = []
-    for prev, (run_id, ci_run_id, sha, branch, run_at) in itertools.pairwise(rows):
+    for prev, (run_id, ci_run_id, sha, branch, run_at, run_ids) in itertools.pairwise(rows):
         prev_sha = prev[2]
         if prev_sha == sha:
             continue  # a re-run of the same commit: nothing changed
         files = compare.files(repo, prev_sha, sha)
         label = f"{prev_sha[:7]}...{sha[:7]}"
         targets.append(
-            TargetRun(run_id, ci_run_id, sha, branch, run_at, changed_files=files, diff_label=label)
+            TargetRun(
+                run_id,
+                ci_run_id,
+                sha,
+                branch,
+                run_at,
+                changed_files=files,
+                diff_label=label,
+                run_ids=tuple(run_ids),
+            )
         )
     return targets
 
@@ -513,7 +529,7 @@ def evaluate(
     graph, graph_note = graphs.graph_at(run.commit_sha) if known else (None, "diff unknown")
     affected = graph.affected(changed) if graph else {}
     selection = select_tests(history, changed, known, config, affected)
-    failures = actual_failures(session, run.run_id)
+    failures = actual_failures(session, list(run.run_ids or (run.run_id,)))
     caught = [f for f in failures if would_run(selection, f)]
     missed = [
         explain_miss(f, history, changed, config.go_module, graph)

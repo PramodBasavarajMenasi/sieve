@@ -13,6 +13,7 @@ import fnmatch
 import io
 import json
 import os
+import re
 import time
 import zipfile
 from collections.abc import Callable, Iterator
@@ -364,12 +365,18 @@ class SieveClient:
     ) -> None:
         self._http.close()
 
-    def lookup(self, repo: str, ci_run_id: str, run_attempt: int) -> Json | None:
-        """The stored run for this CI run attempt, or None if sieve doesn't have it."""
-        response = self._http.get(
-            "/runs/lookup",
-            params={"repo": repo, "ci_run_id": ci_run_id, "run_attempt": run_attempt},
-        )
+    def lookup(
+        self, repo: str, ci_run_id: str, run_attempt: int, variant: str | None = None
+    ) -> Json | None:
+        """The stored run for this CI run attempt and variant, or None if sieve lacks it."""
+        params: dict[str, str | int] = {
+            "repo": repo,
+            "ci_run_id": ci_run_id,
+            "run_attempt": run_attempt,
+        }
+        if variant is not None:
+            params["variant"] = variant
+        response = self._http.get("/runs/lookup", params=params)
         if response.status_code == httpx.codes.NOT_FOUND:
             return None
         response.raise_for_status()
@@ -456,6 +463,28 @@ def _attempt(run: Json) -> int:
     return int(run.get("run_attempt") or 1)
 
 
+def artifact_variants(names: list[str], pattern: str) -> dict[str, str]:
+    """Variant label per artifact name: the name minus the pattern's literal parts.
+
+    ``3.12-ubuntu-latest-pytest-junit-xml`` with ``*-pytest-junit-xml`` -> ``3.12-ubuntu-latest``.
+    Falls back to the full name when stripping leaves nothing or two artifacts of the run
+    would get the same label (they'd otherwise dedupe into one run).
+    """
+    literals = [part for part in re.split(r"[*?]|\[[^\]]*\]", pattern.lower()) if part]
+    labels: dict[str, str] = {}
+    for name in names:
+        label = name
+        for literal in literals:
+            i = label.lower().find(literal)
+            if i >= 0:
+                label = label[:i] + "-" + label[i + len(literal) :]
+        label = re.sub(r"[-_. ]{2,}", "-", label).strip("-_. ")
+        labels[name] = label or name
+    if len(set(labels.values())) < len(labels):
+        return {name: name for name in names}
+    return labels
+
+
 def backfill_run(
     github: GitHubClient,
     sieve: SieveClient,
@@ -463,9 +492,51 @@ def backfill_run(
     run: Json,
     default_branch: str,
     pattern: str,
+) -> list[tuple[str | None, Outcome, str]]:
+    """Backfill one CI run: each matching artifact is uploaded as its own run (variant).
+
+    Returns ``(variant, outcome, detail)`` per artifact, or one ``(None, ...)`` entry when
+    the run has no matching artifact.
+    """
+    artifacts = [
+        a for a in github.list_artifacts(repo, run["id"]) if artifact_matches(a["name"], pattern)
+    ]
+    if not artifacts:
+        return [(None, Outcome.NO_ARTIFACTS, f"no artifact matches {pattern!r}")]
+
+    variants = artifact_variants([a["name"] for a in artifacts], pattern)
+    diff: list[tuple[list[str], bool]] = []  # fetched once, only if something is uploaded
+
+    def changed_files() -> tuple[list[str], bool]:
+        if not diff:
+            diff.append(github.changed_files(repo, run))
+        return diff[0]
+
+    results: list[tuple[str | None, Outcome, str]] = []
+    for artifact in artifacts:
+        variant = variants[artifact["name"]]
+        try:
+            outcome, detail = _backfill_artifact(
+                github, sieve, repo, run, default_branch, artifact, variant, changed_files
+            )
+        except (httpx.HTTPError, zipfile.BadZipFile, BackfillError) as exc:
+            outcome, detail = Outcome.ERROR, f"{type(exc).__name__}: {exc}"
+        results.append((variant, outcome, detail))
+    return results
+
+
+def _backfill_artifact(
+    github: GitHubClient,
+    sieve: SieveClient,
+    repo: str,
+    run: Json,
+    default_branch: str,
+    artifact: Json,
+    variant: str,
+    changed_files: Callable[[], tuple[list[str], bool]],
 ) -> tuple[Outcome, str]:
-    # Ask sieve first, so re-runs skip ingested runs without touching GitHub's artifacts.
-    stored = sieve.lookup(repo, str(run["id"]), _attempt(run))
+    # Ask sieve first, so re-runs skip ingested variants without downloading anything.
+    stored = sieve.lookup(repo, str(run["id"]), _attempt(run), variant)
     if stored is not None:
         if stored.get("commit_sha") != run["head_sha"]:
             return Outcome.ERROR, (
@@ -474,35 +545,20 @@ def backfill_run(
             )
         return Outcome.SKIPPED, "already ingested"
 
-    artifacts = [
-        a for a in github.list_artifacts(repo, run["id"]) if artifact_matches(a["name"], pattern)
-    ]
-    if not artifacts:
-        return Outcome.NO_ARTIFACTS, f"no artifact matches {pattern!r}"
-
-    files: list[tuple[str, bytes]] = []
-    expired: list[str] = []
-    for artifact in artifacts:
-        archive = (
-            None
-            if artifact.get("expired")
-            else github.download_artifact(artifact["archive_download_url"])
-        )
-        if archive is None:
-            expired.append(artifact["name"])
-            continue
-        budget = MAX_XML_BYTES - sum(len(content) for _, content in files)
-        files.extend(extract_xml(archive, artifact["name"], budget))
-
-    if len(expired) == len(artifacts):
-        return Outcome.EXPIRED, f"artifact(s) expired: {', '.join(expired)}"
+    archive = (
+        None
+        if artifact.get("expired")
+        else github.download_artifact(artifact["archive_download_url"])
+    )
+    if archive is None:
+        return Outcome.EXPIRED, f"artifact expired: {artifact['name']}"
+    files = extract_xml(archive, artifact["name"])
     if not files:
-        return Outcome.NO_ARTIFACTS, "matching artifacts contain no .xml files"
-    if expired:
-        _warn(f"run {run['id']}: uploading without expired artifact(s) {', '.join(expired)}")
+        return Outcome.NO_ARTIFACTS, f"artifact {artifact['name']} contains no .xml files"
 
-    changed, known = github.changed_files(repo, run)
-    response = sieve.upload(files, run_metadata(repo, run, default_branch, changed, known))
+    changed, known = changed_files()
+    metadata = {**run_metadata(repo, run, default_branch, changed, known), "variant": variant}
+    response = sieve.upload(files, metadata)
     if response.status_code == httpx.codes.CREATED:
         return Outcome.NEW, f"{_result_total(response)} results from {len(files)} file(s)"
     if response.status_code == httpx.codes.OK:  # ingested concurrently since the lookup
@@ -532,15 +588,16 @@ def backfill(
     summary = Summary()
     for run in github.iter_completed_runs(repo, workflow, max_runs):
         try:
-            outcome, detail = backfill_run(github, sieve, repo, run, default_branch, pattern)
+            results = backfill_run(github, sieve, repo, run, default_branch, pattern)
         except (httpx.HTTPError, zipfile.BadZipFile, BackfillError) as exc:
-            outcome, detail = Outcome.ERROR, f"{type(exc).__name__}: {exc}"
-        summary.add(outcome)
+            results = [(None, Outcome.ERROR, f"{type(exc).__name__}: {exc}")]
         label = (
             f"run {run['id']} #{_attempt(run)} "
             f"{str(run.get('head_sha', ''))[:7]} {run.get('head_branch')}"
         )
-        echo(f"{label}: {outcome.value} ({detail})")
+        for variant, outcome, detail in results:
+            summary.add(outcome)
+            echo(f"{label}{f' [{variant}]' if variant else ''}: {outcome.value} ({detail})")
     return summary
 
 

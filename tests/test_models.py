@@ -105,7 +105,7 @@ def test_ci_run_attempt_is_unique_per_repo(db_session: Session) -> None:
     other = add_run(db_session, "acme/other")
     add(other.repo_id, "123", 1)  # same CI id in another repo is fine
 
-    with pytest.raises(IntegrityError, match="uq_runs_repo_id_ci_run_id_run_attempt"):
+    with pytest.raises(IntegrityError, match="uq_runs_repo_ci_run_attempt_variant"):
         add(run.repo_id, "123", 1)
 
 
@@ -156,6 +156,34 @@ def test_message_is_truncated_on_orm_and_bulk_insert(db_session: Session) -> Non
         budget = MESSAGE_MAX_BYTES - len(TRUNCATION_MARKER.encode())
         assert message == "€" * (budget // 3) + TRUNCATION_MARKER
     assert stored["t::none"] is None
+
+
+def test_unique_key_is_per_variant(db_session: Session) -> None:
+    run = add_run(db_session)
+
+    def add(variant: str | None) -> None:
+        db_session.add(
+            Run(
+                repo_id=run.repo_id,
+                commit_sha="c" * 40,
+                branch="main",
+                is_main=True,
+                ci_run_id="777",
+                run_attempt=1,
+                variant=variant,
+            )
+        )
+        db_session.flush()
+
+    add("ubuntu-py3.12")
+    add("macos-py3.12")  # same CI run attempt, another matrix leg: fine
+    add(None)
+    for duplicate in ("ubuntu-py3.12", None):  # NULL variants dedupe too (COALESCE)
+        with (
+            db_session.begin_nested(),
+            pytest.raises(IntegrityError, match="uq_runs_repo_ci_run_attempt_variant"),
+        ):
+            add(duplicate)
 
 
 def test_deleting_repo_cascades(db_session: Session) -> None:

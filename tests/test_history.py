@@ -40,6 +40,7 @@ def ingest(
     is_main: bool = True,
     ci_run_id: str | None = None,
     run_attempt: int = 1,
+    variant: str | None = None,
     repo: str = REPO,
     duration_ms: int | None = 10,
 ) -> Run:
@@ -66,6 +67,7 @@ def ingest(
         is_main=is_main,
         ci_run_id=ci_run_id,
         run_attempt=run_attempt,
+        variant=variant,
         started_at=None if hour is None else at(hour),
     )
     run, created = create_run(session, meta, results)
@@ -174,6 +176,84 @@ def test_flaky_pass_on_main_is_not_broken(db_session: Session) -> None:
     ingest(db_session, commit=1, hour=1, tests={"t::a": F})
     ingest(db_session, commit=2, hour=2, tests={"t::a": [F, P]})
     assert stats(db_session).broken_on_main_since_sha is None
+
+
+# --- matrix variants ----------------------------------------------------------------------
+
+LINUX, MACOS = "ubuntu-py3.12", "macos-py3.12"
+
+
+def test_platform_difference_is_not_flaky(db_session: Session) -> None:
+    # Same commit, same CI run: passes on Linux, fails on macOS. A real platform difference.
+    ingest(db_session, commit=1, hour=1, tests={"t::a": P}, ci_run_id="9", variant=LINUX)
+    ingest(db_session, commit=1, hour=1, tests={"t::a": F}, ci_run_id="9", variant=MACOS)
+
+    s = stats(db_session)
+    assert s.flaky_score == 0.0
+    assert (s.runs, s.failures) == (2, 1)  # one run per variant
+
+
+def test_fail_and_pass_within_one_variant_is_flaky(db_session: Session) -> None:
+    # macOS fails, then passes on a re-run of the same commit; Linux always passes.
+    ingest(db_session, commit=1, hour=1, tests={"t::a": P}, ci_run_id="9", variant=LINUX)
+    ingest(db_session, commit=1, hour=1, tests={"t::a": F}, ci_run_id="9", variant=MACOS)
+    ingest(db_session, commit=1, hour=2, tests={"t::a": P}, ci_run_id="9", run_attempt=2,
+           variant=MACOS)  # fmt: skip
+
+    # (commit 1, linux) clean, (commit 1, macos) flaky: 1 of 2 pairs.
+    assert stats(db_session).flaky_score == 0.5
+
+
+def test_broken_on_main_is_tracked_per_variant(db_session: Session) -> None:
+    def broken() -> tuple[str | None, list[dict[str, str | None]] | None]:
+        s = stats(db_session)
+        return s.broken_on_main_since_sha, s.broken_on_main_variants
+
+    for variant in (LINUX, MACOS):
+        ingest(db_session, commit=1, hour=1, tests={"t::a": P}, ci_run_id="1", variant=variant)
+    assert broken() == (None, None)
+
+    # macOS starts failing on commit 2; Linux keeps passing. Broken on main (on macOS only).
+    ingest(db_session, commit=2, hour=2, tests={"t::a": P}, ci_run_id="2", variant=LINUX)
+    ingest(db_session, commit=2, hour=2, tests={"t::a": F}, ci_run_id="2", variant=MACOS)
+    assert broken() == (sha(2), [{"variant": MACOS, "since_sha": sha(2)}])
+
+    # Linux breaks too on commit 3: both listed, oldest streak first; since = earliest.
+    ingest(db_session, commit=3, hour=3, tests={"t::a": F}, ci_run_id="3", variant=LINUX)
+    ingest(db_session, commit=3, hour=3, tests={"t::a": F}, ci_run_id="3", variant=MACOS)
+    assert broken() == (
+        sha(2),
+        [{"variant": MACOS, "since_sha": sha(2)}, {"variant": LINUX, "since_sha": sha(3)}],
+    )
+
+    # macOS is fixed; Linux still failing.
+    ingest(db_session, commit=4, hour=4, tests={"t::a": F}, ci_run_id="4", variant=LINUX)
+    ingest(db_session, commit=4, hour=4, tests={"t::a": P}, ci_run_id="4", variant=MACOS)
+    assert broken() == (sha(3), [{"variant": LINUX, "since_sha": sha(3)}])
+
+    # Both pass: cleared.
+    for variant in (LINUX, MACOS):
+        ingest(db_session, commit=5, hour=5, tests={"t::a": P}, ci_run_id="5", variant=variant)
+    assert broken() == (None, None)
+
+
+def test_runs_without_variant_are_one_variant(db_session: Session) -> None:
+    ingest(db_session, commit=1, hour=1, tests={"t::a": F})
+    assert stats(db_session).broken_on_main_variants == [{"variant": None, "since_sha": sha(1)}]
+
+
+def test_history_api_reports_variants(client: TestClient, db_session: Session) -> None:
+    ingest(db_session, commit=1, hour=1, tests={"t::a": P}, ci_run_id="1", variant=LINUX)
+    ingest(db_session, commit=1, hour=1, tests={"t::a": F}, ci_run_id="1", variant=MACOS)
+
+    body = client.get(history_url("t::a"), params={"repo": REPO}, headers=AUTH).json()
+
+    assert body["stats"]["broken_on_main_variants"] == [{"variant": MACOS, "since_sha": sha(1)}]
+    assert body["stats"]["flaky_score"] == 0.0
+    assert sorted((r["variant"], r["status"]) for r in body["results"]) == [
+        (MACOS, "failed"),
+        (LINUX, "passed"),
+    ]
 
 
 # --- out-of-order (backfill) ingest -------------------------------------------------------

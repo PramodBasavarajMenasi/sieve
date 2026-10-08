@@ -10,14 +10,20 @@ Definitions:
   "latest" is ordered by it, tie-broken by run id.
 * A test's *outcome* in a run is the status of its final attempt (highest ``attempt``).
   ``error`` counts as a failure everywhere.
+* A *run* is one variant (matrix leg, e.g. ``ubuntu-py3.12``) of a CI run attempt; each
+  variant is uploaded as its own run. Results are compared only within the same variant.
 * ``runs``: runs whose outcome is not ``skipped``.
 * ``failures``: runs whose outcome is ``failed``/``error``; ``last_failed_at`` is the latest
   such run's time.
 * ``avg_duration_ms``: mean over all non-skipped attempts that report a duration.
-* ``flaky_score``: of the commits where the test ran (non-skipped), the fraction where it
-  had both a failed/error and a passed result, across all attempts and runs of that commit.
-* ``broken_on_main_since_sha``: if the latest non-skipped outcome on main is a failure, the
-  commit of the oldest run in that unbroken failing streak; ``NULL`` once it passes on main.
+* ``flaky_score``: of the (commit, variant) pairs where the test ran (non-skipped), the
+  fraction where it had both a failed/error and a passed result, across all attempts and
+  runs of that commit and variant. Passing on one OS and failing on another is not flaky.
+* Broken on main is tracked per variant: a variant is broken if its latest non-skipped
+  outcome on main is a failure, starting at the oldest run of that unbroken failing streak.
+  ``broken_on_main_variants`` lists every broken variant with its streak start (oldest
+  first); ``broken_on_main_since_sha`` is the earliest of them. Both are ``NULL`` once every
+  variant passes on main again.
 """
 
 from sqlalchemy import select, text
@@ -42,37 +48,51 @@ WITH affected AS (
 ),
 results AS (
     SELECT tr.id, tr.test_id, tr.run_id, tr.status, tr.attempt, tr.duration_ms,
-           ru.commit_sha, ru.is_main, COALESCE(ru.started_at, ru.created_at) AS run_at
+           ru.commit_sha, ru.is_main, ru.variant, COALESCE(ru.variant, '') AS variant_key,
+           COALESCE(ru.started_at, ru.created_at) AS run_at
     FROM affected
     JOIN test_results tr USING (test_id)
     JOIN runs ru ON ru.id = tr.run_id
     WHERE ru.repo_id = :repo_id
 ),
-per_run AS (  -- one row per (test, run)
-    SELECT test_id, run_id, commit_sha, is_main, run_at,
+per_run AS (  -- one row per (test, run); each run is one variant of a CI run
+    SELECT test_id, run_id, commit_sha, is_main, variant, variant_key, run_at,
            (array_agg(status ORDER BY attempt DESC, id DESC))[1] AS outcome,
            sum(duration_ms) FILTER (WHERE status <> 'skipped') AS duration_sum,
            count(duration_ms) FILTER (WHERE status <> 'skipped') AS duration_count,
            bool_or(status IN ('failed', 'error')) AS any_failed,
            bool_or(status = 'passed') AS any_passed
     FROM results
-    GROUP BY test_id, run_id, commit_sha, is_main, run_at
+    GROUP BY test_id, run_id, commit_sha, is_main, variant, variant_key, run_at
 ),
 annotated AS (
     SELECT *,
-           -- flakiness is per commit, across every run of that commit
+           -- flaky: a failure and a pass for the same commit *and variant* (so passing on
+           -- linux and failing on macos is a platform difference, not flakiness)
            bool_or(any_failed) OVER by_commit AND bool_or(any_passed) OVER by_commit
                AS commit_flaky,
            bool_or(any_failed OR any_passed) OVER by_commit AS commit_ran,
-           row_number() OVER (PARTITION BY test_id, commit_sha ORDER BY run_id) AS commit_row,
+           row_number() OVER (
+               PARTITION BY test_id, commit_sha, variant_key ORDER BY run_id
+           ) AS commit_row,
            is_main AND outcome <> 'skipped' AS main_ran,
-           -- passes at or after this run on main; 0 = inside the current failing streak
+           -- passes at or after this run on main, per variant; 0 = in the failing streak
            count(*) FILTER (WHERE outcome = 'passed') OVER (
-               PARTITION BY test_id, is_main AND outcome <> 'skipped'
+               PARTITION BY test_id, variant_key, is_main AND outcome <> 'skipped'
                ORDER BY run_at DESC, run_id DESC
            ) AS newer_main_passes
     FROM per_run
-    WINDOW by_commit AS (PARTITION BY test_id, commit_sha)
+    WINDOW by_commit AS (PARTITION BY test_id, commit_sha, variant_key)
+),
+streaks AS (
+    SELECT *,
+           main_ran AND newer_main_passes = 0 AS in_streak,
+           -- 1 = the oldest run of this variant's current failing streak on main
+           row_number() OVER (
+               PARTITION BY test_id, variant_key, main_ran AND newer_main_passes = 0
+               ORDER BY run_at, run_id
+           ) AS streak_pos
+    FROM annotated
 ),
 stats AS (
     SELECT :repo_id AS repo_id, test_id,
@@ -87,16 +107,20 @@ stats AS (
            (sum(duration_sum)::numeric / NULLIF(sum(duration_count), 0))::float8
                AS avg_duration_ms,
            (array_agg(commit_sha ORDER BY run_at, run_id)
-               FILTER (WHERE main_ran AND newer_main_passes = 0))[1] AS broken_on_main_since_sha
-    FROM annotated
+               FILTER (WHERE in_streak AND streak_pos = 1))[1] AS broken_on_main_since_sha,
+           jsonb_agg(
+               jsonb_build_object('variant', variant, 'since_sha', commit_sha)
+               ORDER BY run_at, run_id
+           ) FILTER (WHERE in_streak AND streak_pos = 1) AS broken_on_main_variants
+    FROM streaks
     GROUP BY test_id
 )
 INSERT INTO test_stats AS ts (
     repo_id, test_id, runs, failures, last_failed_at, flaky_score, avg_duration_ms,
-    broken_on_main_since_sha
+    broken_on_main_since_sha, broken_on_main_variants
 )
 SELECT repo_id, test_id, runs, failures, last_failed_at, flaky_score, avg_duration_ms,
-       broken_on_main_since_sha
+       broken_on_main_since_sha, broken_on_main_variants
 FROM stats
 ON CONFLICT (repo_id, test_id) DO UPDATE SET
     runs = EXCLUDED.runs,
@@ -104,7 +128,8 @@ ON CONFLICT (repo_id, test_id) DO UPDATE SET
     last_failed_at = EXCLUDED.last_failed_at,
     flaky_score = EXCLUDED.flaky_score,
     avg_duration_ms = EXCLUDED.avg_duration_ms,
-    broken_on_main_since_sha = EXCLUDED.broken_on_main_since_sha
+    broken_on_main_since_sha = EXCLUDED.broken_on_main_since_sha,
+    broken_on_main_variants = EXCLUDED.broken_on_main_variants
 """
 )
 

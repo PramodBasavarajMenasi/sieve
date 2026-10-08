@@ -188,7 +188,8 @@ def test_normal_run_is_uploaded(router: respx.MockRouter, clock: FakeClock) -> N
     summary, lines = run_backfill(clock)
 
     assert counts(summary) == {"new": 1}
-    assert "run 101 #2 aaaaaaa main: new (12 results from 2 file(s))" in lines
+    # The variant is the artifact name minus the pattern's literal part ("junit").
+    assert "run 101 #2 aaaaaaa main [results]: new (12 results from 2 file(s))" in lines
     assert not coverage.called  # non-matching artifacts are never downloaded
 
     request = sieve.calls.last.request
@@ -204,9 +205,15 @@ def test_normal_run_is_uploaded(router: respx.MockRouter, clock: FakeClock) -> N
         "started_at": "2026-09-01T10:00:00Z",
         "changed_files": ["src/a.py", "src/new.py", "src/old.py"],
         "changed_files_known": True,
+        "variant": "results",
     }
     lookup = router["lookup"].calls.last.request
-    assert dict(lookup.url.params) == {"repo": REPO, "ci_run_id": "101", "run_attempt": "2"}
+    assert dict(lookup.url.params) == {
+        "repo": REPO,
+        "ci_run_id": "101",
+        "run_attempt": "2",
+        "variant": "results",
+    }
     assert lookup.headers["authorization"] == "Bearer sieve-token"
     assert files == [
         ("junit-results/pytest.xml", PYTEST_XML),
@@ -251,12 +258,13 @@ def test_started_at_falls_back_to_created_at(router: respx.MockRouter, clock: Fa
 # --- re-runs ------------------------------------------------------------------------------
 
 
-def lookup_finds(*run_ids: int, commit_sha: str = HEAD) -> Any:
-    """A /runs/lookup side effect: sieve has exactly these runs."""
+def lookup_finds(*run_ids: int, commit_sha: str = HEAD, variants: set[str] | None = None) -> Any:
+    """A /runs/lookup side effect: sieve has these runs (only these variants, if given)."""
 
     def respond(request: httpx.Request) -> httpx.Response:
         run_id = int(request.url.params["ci_run_id"])
-        if run_id not in run_ids:
+        variant = request.url.params.get("variant")
+        if run_id not in run_ids or (variants is not None and variant not in variants):
             return httpx.Response(404, json={"detail": "not found"})
         return httpx.Response(200, json={"run_id": run_id, "commit_sha": commit_sha})
 
@@ -268,7 +276,8 @@ def test_already_ingested_run_is_skipped_without_downloading(
 ) -> None:
     mock_runs(router, gh_run(1), gh_run(2))
     router["lookup"].mock(side_effect=lookup_finds(1))
-    artifacts_1 = router.get(f"{GH}/repos/{REPO}/actions/runs/1/artifacts").respond(json={})
+    mock_artifacts(router, 1, artifact(10, "junit-results"))
+    download_1 = mock_download(router, 10, make_zip({"pytest.xml": PYTEST_XML}))
     standard_run(router, gh_run(2))
     commit = mock_changed_files(router, [])
     sieve = mock_sieve(router, 201)
@@ -278,7 +287,7 @@ def test_already_ingested_run_is_skipped_without_downloading(
     assert counts(summary) == {"new": 1, "skipped": 1}
     assert str(summary) == "1 new, 1 skipped, 0 no artifacts, 0 expired, 0 errors"
     assert lines[0].startswith("run 1 ") and lines[0].endswith("skipped (already ingested)")
-    assert not artifacts_1.called  # nothing fetched from GitHub for run 1
+    assert not download_1.called  # listed (to learn the variants), never downloaded
     assert sieve.call_count == 1 and commit.call_count == 1  # only run 2
 
 
@@ -287,14 +296,17 @@ def test_rerun_of_full_backfill_downloads_nothing(
 ) -> None:
     mock_runs(router, gh_run(1), gh_run(2), gh_run(3))
     router["lookup"].mock(side_effect=lookup_finds(1, 2, 3))
+    for run_id in (1, 2, 3):
+        standard_run(router, gh_run(run_id))
 
     summary, _ = run_backfill(clock)
 
     assert counts(summary) == {"skipped": 3}
-    # Only the repo info, the runs list and the lookups were requested.
+    # Only the repo info, the runs list, artifact lists and the lookups were requested.
     assert {call.request.url.path for call in router.calls} == {
         f"/repos/{REPO}",
         f"/repos/{REPO}/actions/runs",
+        *(f"/repos/{REPO}/actions/runs/{run_id}/artifacts" for run_id in (1, 2, 3)),
         "/runs/lookup",
     }
 
@@ -316,6 +328,7 @@ def test_lookup_with_different_commit_is_an_error(
     router: respx.MockRouter, clock: FakeClock
 ) -> None:
     mock_runs(router, gh_run(1))
+    standard_run(router, gh_run(1))
     router["lookup"].mock(side_effect=lookup_finds(1, commit_sha="c" * 40))
 
     summary, lines = run_backfill(clock)
@@ -328,10 +341,9 @@ def test_lookup_failure_is_an_error_for_that_run(
     router: respx.MockRouter, clock: FakeClock
 ) -> None:
     mock_runs(router, gh_run(1), gh_run(2))
-    router["lookup"].mock(
-        side_effect=[httpx.Response(500), httpx.Response(404)],
-    )
-    mock_artifacts(router, 2)
+    standard_run(router, gh_run(1))
+    router["lookup"].mock(side_effect=[httpx.Response(500)])
+    mock_artifacts(router, 2)  # no artifacts: no lookup for run 2
 
     summary, lines = run_backfill(clock)
 
@@ -416,10 +428,85 @@ def test_partially_expired_run_uploads_what_remains(
     mock_changed_files(router, [])
     sieve = mock_sieve(router, 201)
 
-    summary, _ = run_backfill(clock)
+    summary, lines = run_backfill(clock)
 
-    assert counts(summary) == {"new": 1}
-    assert [name for name, _ in parse_upload(sieve.calls.last.request)[1]] == ["junit-b/go.xml"]
+    # Each artifact is its own variant: the expired one is reported, the other uploaded.
+    assert counts(summary) == {"new": 1, "expired": 1}
+    assert any("[a]: expired" in line for line in lines)
+    metadata, files = parse_upload(sieve.calls.last.request)
+    assert (metadata["variant"], [name for name, _ in files]) == ("b", ["junit-b/go.xml"])
+
+
+# --- matrix variants ----------------------------------------------------------------------
+
+MATRIX = "*-pytest-junit-xml"
+
+
+def test_matrix_artifacts_are_uploaded_as_separate_variants(
+    router: respx.MockRouter, clock: FakeClock
+) -> None:
+    mock_runs(router, gh_run(1))
+    mock_artifacts(
+        router,
+        1,
+        artifact(10, "3.12-ubuntu-latest-pytest-junit-xml"),
+        artifact(11, "3.12-macos-latest-pytest-junit-xml"),
+    )
+    mock_download(router, 10, make_zip({"linux.xml": PYTEST_XML}))
+    mock_download(router, 11, make_zip({"mac.xml": GO_XML}))
+    compare = mock_changed_files(router, [{"filename": "src/a.py"}])
+    sieve = mock_sieve(router, 201, 201)
+
+    summary, lines = run_backfill(clock, pattern=MATRIX)
+
+    assert counts(summary) == {"new": 2}
+    uploads = [parse_upload(call.request) for call in sieve.calls]
+    assert [(meta["variant"], [name for name, _ in files]) for meta, files in uploads] == [
+        ("3.12-ubuntu-latest", ["3.12-ubuntu-latest-pytest-junit-xml/linux.xml"]),
+        ("3.12-macos-latest", ["3.12-macos-latest-pytest-junit-xml/mac.xml"]),
+    ]
+    assert {meta["ci_run_id"] for meta, _ in uploads} == {"1"}  # same CI run
+    assert compare.call_count == 1  # the diff is fetched once per CI run
+    assert lines[0].endswith("[3.12-ubuntu-latest]: new (12 results from 1 file(s))")
+
+
+def test_rerun_uploads_only_the_missing_variant(router: respx.MockRouter, clock: FakeClock) -> None:
+    mock_runs(router, gh_run(1))
+    mock_artifacts(
+        router,
+        1,
+        artifact(10, "3.12-ubuntu-latest-pytest-junit-xml"),
+        artifact(11, "3.12-macos-latest-pytest-junit-xml"),
+    )
+    linux = mock_download(router, 10, make_zip({"linux.xml": PYTEST_XML}))
+    mock_download(router, 11, make_zip({"mac.xml": GO_XML}))
+    mock_changed_files(router, [])
+    router["lookup"].mock(side_effect=lookup_finds(1, variants={"3.12-ubuntu-latest"}))
+    sieve = mock_sieve(router, 201)
+
+    summary, _ = run_backfill(clock, pattern=MATRIX)
+
+    assert counts(summary) == {"skipped": 1, "new": 1}
+    assert not linux.called
+    assert parse_upload(sieve.calls.last.request)[0]["variant"] == "3.12-macos-latest"
+
+
+@pytest.mark.parametrize(
+    ("names", "pattern", "expected"),
+    [
+        (["cli-tests-junit", "unit-tests-junit"], "*junit*",
+         {"cli-tests-junit": "cli-tests", "unit-tests-junit": "unit-tests"}),
+        (["3.10-ubuntu-latest-extensive-pytest-junit-xml"], "*junit*",
+         {"3.10-ubuntu-latest-extensive-pytest-junit-xml":
+              "3.10-ubuntu-latest-extensive-pytest-xml"}),
+        (["Test-Results-Linux"], "test-results-*", {"Test-Results-Linux": "Linux"}),
+        (["junit"], "*junit*", {"junit": "junit"}),  # nothing left: keep the name
+        # Two artifacts would both become "a": use full names so neither is lost.
+        (["junit-a", "a-junit"], "*junit*", {"junit-a": "junit-a", "a-junit": "a-junit"}),
+    ],
+)  # fmt: skip
+def test_artifact_variants(names: list[str], pattern: str, expected: dict[str, str]) -> None:
+    assert bf.artifact_variants(names, pattern) == expected
 
 
 def test_oversized_artifact_is_rejected_before_decompressing() -> None:

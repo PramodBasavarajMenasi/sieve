@@ -3,11 +3,26 @@
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+)
 
 from sieve.core.junit import Status, normalize_path
 
 NonEmpty255 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+
+
+def _blank_to_none(value: object) -> object:
+    return None if isinstance(value, str) and not value.strip() else value
+
+
+# Matrix variant of a CI run, e.g. "ubuntu-py3.12". Blank means "no variant" (None).
+Variant = Annotated[NonEmpty255 | None, BeforeValidator(_blank_to_none)]
 
 
 class RunMetadata(BaseModel):
@@ -25,6 +40,11 @@ class RunMetadata(BaseModel):
     is_main: bool
     ci_run_id: NonEmpty255 | None = None
     run_attempt: int = Field(default=1, ge=1)
+    variant: Variant = Field(
+        default=None,
+        description="Matrix leg (OS, Python version...). Each variant of a CI run attempt is "
+        "its own run; results are only compared within the same variant.",
+    )
     started_at: datetime | None = None
     changed_files: list[str] = Field(default_factory=list)
     changed_files_known: bool = Field(
@@ -63,6 +83,7 @@ class RunLookupResponse(BaseModel):
     repo: str
     ci_run_id: str
     run_attempt: int
+    variant: str | None
     commit_sha: str
 
 
@@ -123,16 +144,33 @@ class SelectResponse(BaseModel):
     tests: list[SelectedTestOut] = Field(description="Selected tests; empty in full mode")
 
 
+class BrokenVariant(BaseModel):
+    variant: str | None
+    since_sha: str
+
+
 class TestStatsOut(BaseModel):
     __test__ = False  # not a pytest test class
     model_config = ConfigDict(from_attributes=True)
 
-    runs: int
+    runs: int = Field(description="Runs (one per variant) where the test's outcome wasn't skipped")
     failures: int
     last_failed_at: datetime | None
-    flaky_score: float
+    flaky_score: float = Field(
+        description="Fraction of (commit, variant) pairs with both a failure and a pass"
+    )
     avg_duration_ms: float | None
-    broken_on_main_since_sha: str | None
+    broken_on_main_since_sha: str | None = Field(
+        description="Earliest start of a failing streak on main, across variants"
+    )
+    broken_on_main_variants: list[BrokenVariant] = Field(
+        default_factory=list, description="Each variant currently failing on main"
+    )
+
+    @field_validator("broken_on_main_variants", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: object) -> object:
+        return value or []
 
 
 class TestResultOut(BaseModel):
@@ -144,6 +182,7 @@ class TestResultOut(BaseModel):
     is_main: bool
     ci_run_id: str | None
     run_attempt: int
+    variant: str | None
     occurred_at: datetime
     status: Status
     attempt: int

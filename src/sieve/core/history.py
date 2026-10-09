@@ -32,6 +32,12 @@ Definitions (all counts are within the window):
   lists every broken variant with its streak start (oldest first);
   ``broken_on_main_since_sha`` is the earliest of them. Both are ``NULL`` once every variant
   passes on main again.
+* ``last_seen_at``: the latest run (any status, skipped included) the test appears in.
+  ``last_seen_run_id``: a run of the latest *CI run* the test appears in, with CI runs ordered
+  as ``selector.recent_ci_runs_sql`` orders them (latest variant time, then highest run id).
+  So "last seen in one of the latest N CI runs" is the same as "appeared in one of them",
+  which is how the selector finds known tests without reading raw results.
+* ``file_path``: the latest non-null file path reported for the test.
 
 Batch ingest (``POST /runs?defer_rollup=true``) skips the rollup; ``recompute_repo_stats``
 (``POST /repos/{repo}/rollup``) then recomputes every test in the window at once. Until it
@@ -63,25 +69,30 @@ _ALL_HISTORY_DAYS = 365 * 100
 # test_results, which is exactly the cost the window exists to avoid.
 # test_history.py::test_rollup_reads_only_the_window_not_old_history checks this.
 _ROLLUP_TEMPLATE = """
-WITH bounds AS MATERIALIZED (
+WITH {run_tests}bounds AS MATERIALIZED (
     SELECT max(COALESCE(started_at, created_at)) - make_interval(days => :window_days)
                AS window_start
     FROM runs WHERE repo_id = :repo_id
 ),
+repo_runs AS (  -- with each run's CI run position, ordered like selector.recent_ci_runs_sql
+    SELECT id, commit_sha, is_main, variant, COALESCE(started_at, created_at) AS run_at,
+           max(COALESCE(started_at, created_at)) OVER ci AS ci_at, max(id) OVER ci AS ci_id
+    FROM runs WHERE repo_id = :repo_id
+    WINDOW ci AS (PARTITION BY COALESCE(ci_run_id, 'run:' || id), run_attempt)
+),
 win_runs AS MATERIALIZED (
     SELECT ru.id, ru.commit_sha, ru.is_main, ru.variant,
-           COALESCE(ru.variant, '') AS variant_key,
-           COALESCE(ru.started_at, ru.created_at) AS run_at
-    FROM runs ru CROSS JOIN bounds
-    WHERE ru.repo_id = :repo_id AND COALESCE(ru.started_at, ru.created_at) >= bounds.window_start
+           COALESCE(ru.variant, '') AS variant_key, ru.run_at, ru.ci_at, ru.ci_id
+    FROM repo_runs ru CROSS JOIN bounds
+    WHERE ru.run_at >= bounds.window_start
 ),
 win_results AS (
-    SELECT tr.id, tr.test_id, tr.run_id, tr.status, tr.attempt, tr.duration_ms,
-           wr.commit_sha, wr.is_main, wr.variant, wr.variant_key, wr.run_at,
+    SELECT tr.id, tr.test_id, tr.run_id, tr.status, tr.attempt, tr.duration_ms, tr.file_path,
+           wr.commit_sha, wr.is_main, wr.variant, wr.variant_key, wr.run_at, wr.ci_at, wr.ci_id,
            true AS in_window
     FROM win_runs wr
     CROSS JOIN LATERAL (
-        SELECT id, test_id, run_id, status, attempt, duration_ms
+        SELECT id, test_id, run_id, status, attempt, duration_ms, file_path
         FROM test_results WHERE run_id = wr.id
         OFFSET 0  -- fence: stops Postgres flattening this into a scan of all test_results
     ) tr
@@ -100,8 +111,9 @@ edge AS (  -- (test, variant) failing on main for the whole window: the streak m
 ),
 old_results AS (  -- older main results, only for those, to find where the streak started
     SELECT tr.id, tr.test_id, tr.run_id, tr.status, tr.attempt, tr.duration_ms,
-           ru.commit_sha, ru.is_main, ru.variant, edge.variant_key,
+           NULL::text, ru.commit_sha, ru.is_main, ru.variant, edge.variant_key,
            COALESCE(ru.started_at, ru.created_at) AS run_at,
+           NULL::timestamptz, NULL::bigint,  -- only window runs count as "seen"
            false AS in_window
     FROM edge
     CROSS JOIN LATERAL (
@@ -119,14 +131,17 @@ results AS (
     SELECT * FROM win_results UNION ALL SELECT * FROM old_results
 ),
 per_run AS (  -- one row per (test, run); each run is one variant of a CI run
-    SELECT test_id, run_id, commit_sha, is_main, variant, variant_key, run_at, in_window,
+    SELECT test_id, run_id, commit_sha, is_main, variant, variant_key, run_at, ci_at, ci_id,
+           in_window,
            (array_agg(status ORDER BY attempt DESC, id DESC))[1] AS outcome,
            sum(duration_ms) FILTER (WHERE status <> 'skipped') AS duration_sum,
            count(duration_ms) FILTER (WHERE status <> 'skipped') AS duration_count,
            bool_or(status IN ('failed', 'error')) AS any_failed,
-           bool_or(status = 'passed') AS any_passed
+           bool_or(status = 'passed') AS any_passed,
+           max(file_path) AS file_path  -- attempts of one test in one run share a file
     FROM results
-    GROUP BY test_id, run_id, commit_sha, is_main, variant, variant_key, run_at, in_window
+    GROUP BY test_id, run_id, commit_sha, is_main, variant, variant_key, run_at, ci_at, ci_id,
+             in_window
 ),
 annotated AS (
     SELECT *,
@@ -176,17 +191,23 @@ stats AS (
            jsonb_agg(
                jsonb_build_object('variant', variant, 'since_sha', commit_sha)
                ORDER BY run_at, run_id
-           ) FILTER (WHERE in_streak AND streak_pos = 1) AS broken_on_main_variants
+           ) FILTER (WHERE in_streak AND streak_pos = 1) AS broken_on_main_variants,
+           max(run_at) FILTER (WHERE in_window) AS last_seen_at,
+           (array_agg(run_id ORDER BY ci_at DESC, ci_id DESC, run_id DESC)
+               FILTER (WHERE in_window))[1] AS last_seen_run_id,
+           (array_agg(file_path ORDER BY run_at DESC, run_id DESC)
+               FILTER (WHERE in_window AND file_path IS NOT NULL))[1] AS file_path
     FROM streaks
     GROUP BY test_id
     HAVING bool_or(in_window)
 )
 INSERT INTO test_stats AS ts (
     repo_id, test_id, runs, failures, last_failed_at, flaky_score, avg_duration_ms,
-    broken_on_main_since_sha, broken_on_main_variants
+    broken_on_main_since_sha, broken_on_main_variants, last_seen_at, last_seen_run_id, file_path
 )
 SELECT repo_id, test_id, runs, failures, last_failed_at, flaky_score, avg_duration_ms,
-       broken_on_main_since_sha, broken_on_main_variants
+       broken_on_main_since_sha, broken_on_main_variants, last_seen_at, last_seen_run_id,
+       file_path
 FROM stats
 ON CONFLICT (repo_id, test_id) DO UPDATE SET
     runs = EXCLUDED.runs,
@@ -195,17 +216,24 @@ ON CONFLICT (repo_id, test_id) DO UPDATE SET
     flaky_score = EXCLUDED.flaky_score,
     avg_duration_ms = EXCLUDED.avg_duration_ms,
     broken_on_main_since_sha = EXCLUDED.broken_on_main_since_sha,
-    broken_on_main_variants = EXCLUDED.broken_on_main_variants
+    broken_on_main_variants = EXCLUDED.broken_on_main_variants,
+    last_seen_at = EXCLUDED.last_seen_at,
+    last_seen_run_id = EXCLUDED.last_seen_run_id,
+    file_path = EXCLUDED.file_path
 """
 
-# After one ingest: only the tests in that run.
+# After one ingest: only the tests in that run. Their list is materialized once: as a plain
+# IN (subquery) the planner sometimes picked a nested loop that re-read the run's results for
+# every result row in the window (18,000 loops, ~40 s, for a 150-test run with 120 uploads).
 _RUN_ROLLUP_SQL = text(
     _ROLLUP_TEMPLATE.format(
-        test_filter="WHERE tr.test_id IN (SELECT test_id FROM test_results WHERE run_id = :run_id)"
+        run_tests="run_tests AS MATERIALIZED ("
+        "SELECT DISTINCT test_id FROM test_results WHERE run_id = :run_id),\n",
+        test_filter="WHERE tr.test_id IN (SELECT test_id FROM run_tests)",
     )
 )
 # Batch: every test with results in the window.
-_REPO_ROLLUP_SQL = text(_ROLLUP_TEMPLATE.format(test_filter=""))
+_REPO_ROLLUP_SQL = text(_ROLLUP_TEMPLATE.format(run_tests="", test_filter=""))
 
 
 def _window_days(window_days: int) -> int:

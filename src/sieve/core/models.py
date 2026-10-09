@@ -131,6 +131,16 @@ class ChangedFile(Base):
 class TestResult(Base):
     __tablename__ = "test_results"
     __test__ = False  # not a pytest test class
+    __table_args__ = (
+        # Failures only (a tiny fraction of rows): the selector's co-change and recently-failed
+        # queries read failures through this, never the passing results around them.
+        Index(
+            "ix_test_results_failed",
+            "run_id",
+            "test_id",
+            postgresql_where=text("status IN ('failed', 'error')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
@@ -154,6 +164,7 @@ class TestResult(Base):
 class TestStats(Base):
     __tablename__ = "test_stats"
     __test__ = False
+    __table_args__ = (Index(None, "repo_id", "last_seen_run_id"),)
 
     repo_id: Mapped[int] = mapped_column(
         ForeignKey("repos.id", ondelete="CASCADE"), primary_key=True
@@ -169,3 +180,10 @@ class TestStats(Base):
     # Which variants are broken on main: [{"variant": str | None, "since_sha": str}], oldest
     # streak first. NULL when not broken on any variant.
     broken_on_main_variants: Mapped[list[dict[str, str | None]] | None] = mapped_column(JSONB)
+    # The test's most recent appearance (any status) in the window: the run's time, and one
+    # run (variant) of the latest CI run it appeared in, by the selector's CI-run order. The
+    # selector's "known tests" are those whose last-seen run is in the repo's latest CI runs.
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_seen_run_id: Mapped[int | None] = mapped_column(BigInteger)
+    # Test file as reported in the window (latest non-null), for the selector's commands.
+    file_path: Mapped[str | None] = mapped_column(Text)

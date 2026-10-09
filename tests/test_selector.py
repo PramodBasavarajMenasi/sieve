@@ -3,8 +3,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
+from sieve.core.history import recompute_repo_stats
 from sieve.core.ingest import create_run
 from sieve.core.junit import ParsedTestResult, Status
 from sieve.core.schemas import RunMetadata
@@ -621,6 +623,80 @@ def test_pytest_command_uses_node_ids_and_quotes_params() -> None:
     assert shlex.split(selection.command)[2] == "tests/test_cart.py::test_param[a b-1]"
 
 
+# --- pytest collection errors -------------------------------------------------------------
+
+# A module that fails to import: pytest's JUnit has no classname, the suite is named "pytest"
+# and the test name is the dotted module (rdflib's CI reports doctest modules this way).
+SOURCE_MODULE_ERROR = "pytest::rdflib.plugins.serializers.n3"
+TEST_MODULE_ERROR = "pytest::test.test_dataset.test_dataset_default_graph"
+
+
+def test_collection_error_of_a_source_module_runs_that_module() -> None:
+    # Co-change pulls it in: it failed in an earlier run that touched the same file.
+    earlier = FailedRun(3, "c" * 40, frozenset({"rdflib/plugins/sparql/parser.py"}),
+                        frozenset({SOURCE_MODULE_ERROR}))  # fmt: skip
+    hist = history("test.test_sparql.test_parser::test_x", SOURCE_MODULE_ERROR,
+                   failed_runs=(earlier,))  # fmt: skip
+    selection = select(hist, "rdflib/plugins/sparql/parser.py")
+
+    assert selection.mode is Mode.SELECTIVE
+    assert ids(selection) == [SOURCE_MODULE_ERROR, "test.test_sparql.test_parser::test_x"]
+    assert selection.commands == (
+        "pytest rdflib/plugins/serializers/n3.py test/test_sparql/test_parser.py::test_x",
+    )
+    [error] = [t for t in selection.tests if t.test_id == SOURCE_MODULE_ERROR]
+    assert error.runner is Runner.PYTEST
+
+
+def test_collection_error_of_a_test_module_is_selected_by_its_file() -> None:
+    changed = "test/test_dataset/test_dataset_default_graph.py"
+    selection = select(history(TEST_MODULE_ERROR, "test.test_other::test_y"), changed)
+
+    assert selection.mode is Mode.SELECTIVE
+    assert reasons(selection) == {TEST_MODULE_ERROR: f"test file changed: {changed}"}
+    assert selection.commands == (f"pytest {changed}",)
+
+
+def test_collection_error_file_replaces_node_ids_in_the_same_file() -> None:
+    hist = history("pytest::test.test_cart", "test.test_cart::test_total",
+                   recent_main_failures={"pytest::test.test_cart": (5, "e" * 40)})  # fmt: skip
+    selection = select(hist, "src/cart.py")
+
+    assert set(ids(selection)) == {"pytest::test.test_cart", "test.test_cart::test_total"}
+    assert selection.commands == ("pytest test/test_cart.py",)  # not also ...::test_total
+
+
+def test_collection_error_file_path_attribute_wins() -> None:
+    hist = history(("pytest::shop.cart", "src/shop/cart.py"), "tests.test_cart::test_total",
+                   recent_main_failures={"pytest::shop.cart": (5, "e" * 40)})  # fmt: skip
+    assert select(hist, "src/shop/cart.py").commands == (
+        "pytest src/shop/cart.py tests/test_cart.py::test_total",
+    )
+
+
+@pytest.mark.parametrize("name", ["not a module", "a/b.py", "", "a..b"])
+def test_collection_error_without_a_derivable_file_is_left_out_of_the_command(name: str) -> None:
+    # Selected (it failed on main), but there is no file to pass to pytest: skip it in the
+    # command instead of forcing the full suite.
+    error = f"pytest::{name}"
+    hist = history(error, "tests.test_cart::test_total",
+                   recent_main_failures={error: (5, "e" * 40)})  # fmt: skip
+    selection = select(hist, "src/cart.py")
+
+    assert selection.mode is Mode.SELECTIVE
+    assert set(ids(selection)) == {error, "tests.test_cart::test_total"}
+    assert selection.commands == ("pytest tests/test_cart.py::test_total",)
+
+
+def test_only_underivable_collection_errors_give_an_empty_command() -> None:
+    error = "pytest::not a module"
+    hist = history(error, "tests.test_cart::test_total",
+                   recent_main_failures={error: (5, "e" * 40)})  # fmt: skip
+    selection = select(hist, "README.md")
+
+    assert (selection.mode, ids(selection), selection.command) == (Mode.SELECTIVE, [error], "")
+
+
 def test_go_packages_with_changed_files_run_whole() -> None:
     # No -run: tests added in this change aren't in history yet but must still run.
     selection = select(GO, "test/cli/add.go", "core/coreunix/add.go", go_module=KUBO)
@@ -807,6 +883,97 @@ def test_load_history_from_runs(db_session: Session) -> None:
         (run2, frozenset(), frozenset({"tests.test_b::test_y"})),
         (run1, frozenset({"src/a.py"}), frozenset({"tests.test_a::test_x"})),
     ]
+
+
+def _test_result_rows_read(plan: dict[str, Any]) -> int:
+    """Rows a plan read from test_results: returned, plus any read and then filtered out."""
+    rows = 0
+    if plan.get("Relation Name") == "test_results":
+        loops = plan.get("Actual Loops", 0)
+        for key in ("Actual Rows", "Rows Removed by Filter", "Rows Removed by Index Recheck"):
+            rows += plan.get(key, 0) * loops
+    return rows + sum(_test_result_rows_read(child) for child in plan.get("Plans", []))
+
+
+def test_load_history_does_not_read_passing_raw_results(db_session: Session) -> None:
+    # 30 CI runs x 4 matrix legs x 150 passing tests = 18,000 passing rows, all in the windows
+    # load_history looks at, plus one failure per CI run.
+    passing = {f"tests.test_m{i}::test_ok": P for i in range(150)}
+    for n in range(1, 31):
+        for leg in ("a", "b", "c", "d"):
+            tests = dict(passing)
+            if leg == "a":
+                tests[f"tests.test_fail::test_{n % 3}"] = F
+            results = [ParsedTestResult(t, t.split("::")[0], t.split("::")[1], None, s, 1, 1)
+                       for t, s in tests.items()]  # fmt: skip
+            meta = RunMetadata(repo=REPO, commit_sha=f"{n:040x}", branch="b", is_main=n % 2 == 0,
+                               started_at=T0 + timedelta(hours=n), ci_run_id=str(n),
+                               variant=leg, changed_files=[f"src/f{n % 5}.py"])  # fmt: skip
+            run, _ = create_run(db_session, meta, results, rollup=False)  # batch ingest
+    recompute_repo_stats(db_session, run.repo_id, 90)
+    db_session.execute(text("ANALYZE test_results"))
+    db_session.execute(text("ANALYZE runs"))
+    db_session.execute(text("ANALYZE test_stats"))
+    failing_rows = db_session.scalar(
+        text("SELECT count(*) FROM test_results WHERE status IN ('failed', 'error')")
+    )
+
+    statements: list[tuple[str, Any]] = []
+    connection = db_session.connection()
+
+    def record(conn: Any, cursor: Any, statement: str, params: Any, *_: Any) -> None:
+        statements.append((statement, params))
+
+    event.listen(connection, "before_cursor_execute", record)
+    try:
+        hist = load_history(db_session, REPO, SelectorConfig(known_test_runs=5))
+    finally:
+        event.remove(connection, "before_cursor_execute", record)
+
+    assert hist is not None
+    assert len(hist.tests) == 153  # 150 passing tests + the 3 failing ones
+    assert len(hist.failed_runs) == 30
+    assert set(hist.recent_main_failures) == {f"tests.test_fail::test_{k}" for k in range(3)}
+
+    read = 0
+    for statement, params in statements:
+        if "test_results" in statement:
+            plan = connection.exec_driver_sql(
+                "EXPLAIN (ANALYZE, FORMAT JSON) " + statement, params
+            ).scalar_one()[0]["Plan"]
+            read += _test_result_rows_read(plan)
+    assert failing_rows == 30
+    assert read <= 2 * failing_rows  # failures only (co-change + recent main); never 18,000
+
+
+def test_known_tests_come_from_test_stats(db_session: Session) -> None:
+    ingest(db_session, 1, {"tests.test_a::test_x": P})
+    # Rows the rollup never saw (no stats) are not known: load_history doesn't read them.
+    run = ingest(db_session, 2, {"tests.test_a::test_x": P})
+    db_session.execute(
+        text(
+            "INSERT INTO test_results (run_id, test_id, status, attempt) "
+            "VALUES (:run, 'tests.test_raw::only', 'passed', 1)"
+        ),
+        {"run": run},
+    )
+    hist = load_history(db_session, REPO)
+    assert hist is not None
+    assert set(hist.tests) == {"tests.test_a::test_x"}
+
+
+def test_known_tests_keep_the_latest_file_path(db_session: Session) -> None:
+    for n, path in ((1, "tests/old/test_a.py"), (2, "tests/test_a.py"), (3, None)):
+        meta = RunMetadata(repo=REPO, commit_sha=f"{n:040x}", branch="main", is_main=True,
+                           started_at=T0 + timedelta(hours=n))  # fmt: skip
+        result = ParsedTestResult("tests.test_a::test_x", "tests.test_a", "test_x", path, P, 1, 1)
+        create_run(db_session, meta, [result])
+
+    hist = load_history(db_session, REPO)
+    assert hist is not None
+    assert hist.tests["tests.test_a::test_x"] == KnownTest(
+        "tests.test_a::test_x", "tests/test_a.py"
+    )
 
 
 def test_known_tests_are_limited_to_recent_runs(db_session: Session) -> None:

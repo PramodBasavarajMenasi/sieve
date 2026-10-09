@@ -27,6 +27,9 @@ Otherwise it selects the union of these signals, and every test carries its reas
     exactly when ``SelectorConfig.go_module`` is set.
   - JS/TS: ``foo.ts`` selects ``foo.test.*``, ``foo.spec.*`` and ``__tests__/foo.*``.
   - A changed test file always selects its own tests.
+  - pytest collection errors (``pytest::a.b.c``: a module that failed to import) map to the
+    module's file ``a/b/c.py``, which pytest then runs whole. If no file can be derived, the
+    test is still selected but left out of the command rather than forcing the full suite.
 * **Co-change**: tests that failed in recent runs whose changed files overlap this change.
 * **Recently failed**: tests that failed in the last ``recent_main_runs`` main runs, or are
   currently broken on main.
@@ -473,16 +476,29 @@ class _Test:
     # Python only: path of the test module, and classes between module and function.
     py_path: str | None = None
     py_classes: tuple[str, ...] = ()
+    # Python only: what to pass to pytest (``path::Class::test`` or a whole file). None for a
+    # collection error whose file can't be derived: it is selected but left out of commands.
+    py_node: str | None = None
 
 
 def _index(known: Iterable[KnownTest]) -> dict[str, _Test]:
     return {k.test_id: _classify(k) for k in known}
 
 
+# pytest reports a module that fails to import or collect as a testcase with no classname in
+# a suite named "pytest", and the module's dotted name as the test name, so its test ID is
+# e.g. "pytest::rdflib.plugins.serializers.n3" (or "pytest::test.test_foo").
+PYTEST_COLLECTION_CLASSNAME = "pytest"
+
+
 def _classify(test: KnownTest) -> _Test:
     classname, _, name = test.test_id.partition("::")
     file_path = normalize_path(test.file_path)
     ext = posixpath.splitext(file_path or "")[1]
+
+    if classname == PYTEST_COLLECTION_CLASSNAME:
+        module = _collection_error_path(name, file_path)
+        return _Test(test.test_id, classname, name, file_path, Runner.PYTEST, module, (), module)
 
     python = _python_location(classname, file_path)
     if ext == ".go" or (not ext and _looks_like_go(classname, name)):
@@ -495,8 +511,23 @@ def _classify(test: KnownTest) -> _Test:
         runner = None
 
     if runner is Runner.PYTEST and python is not None:
-        return _Test(test.test_id, classname, name, file_path, runner, python[0], python[1])
+        py_path, py_classes = python
+        node = "::".join((py_path, *py_classes, name))
+        return _Test(test.test_id, classname, name, file_path, runner, py_path, py_classes, node)
     return _Test(test.test_id, classname, name, file_path, runner)
+
+
+def _collection_error_path(module: str, file_path: str | None) -> str | None:
+    """The file of a pytest collection error: ``a.b.c`` -> ``a/b/c.py`` (or its file_path).
+
+    None if the name isn't a dotted module name, so no file can be derived.
+    """
+    if file_path and file_path.endswith(".py"):
+        return file_path
+    parts = module.split(".")
+    if not module or not all(_PY_IDENTIFIER.match(p) for p in parts):
+        return None
+    return "/".join(parts) + ".py"
 
 
 def _looks_like_go(classname: str, name: str) -> bool:
@@ -627,10 +658,11 @@ def _build_commands(
     """
     commands: list[str] = []
 
+    nodes = {t.py_node for t in tests if t.runner is Runner.PYTEST and t.py_node}
+    # A whole file (a collection error) already runs every test in it.
+    whole_files = {node for node in nodes if "::" not in node}
     pytest_ids = sorted(
-        "::".join((t.py_path, *t.py_classes, t.name))
-        for t in tests
-        if t.runner is Runner.PYTEST and t.py_path
+        node for node in nodes if "::" not in node or node.partition("::")[0] not in whole_files
     )
     if pytest_ids:
         commands.append(shlex.join(["pytest", *pytest_ids]))
@@ -707,7 +739,14 @@ recent AS (
 def load_history(
     session: Session, repo: str, config: SelectorConfig | None = None
 ) -> RepoHistory | None:
-    """The selector's view of ``repo``'s history, or None if the repo is unknown."""
+    """The selector's view of ``repo``'s history, or None if the repo is unknown.
+
+    Never reads passing raw results, so its cost doesn't grow with the size of the test suite
+    or the matrix: known tests come from ``test_stats`` (its last-seen run, kept by the
+    rollup), and the failure queries go through the partial index on failed results. Known
+    tests are therefore as fresh as the rollup (stale between a deferred batch ingest and
+    ``POST /repos/{repo}/rollup``).
+    """
     config = config or SelectorConfig()
     repo_id = session.execute(
         text("SELECT id FROM repos WHERE name = :name"), {"name": repo}
@@ -716,13 +755,15 @@ def load_history(
         return None
     params = {"repo_id": repo_id}
 
+    # Tests that appeared in one of the latest N CI runs: their last-seen run is in one of them
+    # (core/history.py orders "last seen" by the same CI-run order as recent_ci_runs_sql).
     known = session.execute(
         text(
             f"""
             WITH {_REPO_RUNS}, {recent_ci_runs_sql("repo_runs")}
-            SELECT DISTINCT ON (tr.test_id) tr.test_id, tr.file_path
-            FROM test_results tr JOIN recent ON recent.id = tr.run_id
-            ORDER BY tr.test_id, tr.file_path IS NULL, tr.run_id DESC
+            SELECT ts.test_id, ts.file_path
+            FROM test_stats ts JOIN recent ON recent.id = ts.last_seen_run_id
+            WHERE ts.repo_id = :repo_id
             """
         ),
         {**params, "n": config.known_test_runs},

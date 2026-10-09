@@ -12,7 +12,8 @@ counts. For each target R:
 
 1. Rebuild the selector's history *as of just before R* (no peeking): only runs strictly
    earlier than R by ``COALESCE(started_at, created_at)``. ``test_stats`` is not used for
-   selection; broken-on-main is recomputed per variant from raw results.
+   selection; broken-on-main is recomputed per variant from raw results. The repo's raw
+   results are read once into memory (``HistoryIndex``), so each target is cheap.
 2. Go repos: with ``--checkout`` (+ ``--go``), compute the Go import graph at R's commit
    (``go list -deps -test -json ./...``, cached per commit) and pass it to the selector, as
    ``sieve select`` does.
@@ -35,17 +36,20 @@ Reads SIEVE_DATABASE_URL (or .env), and GITHUB_TOKEN for --replay-main. Read-onl
 
 from __future__ import annotations
 
+import bisect
 import itertools
 import json
 import os
 import posixpath
 import subprocess
 import sys
+import time
 from collections import defaultdict
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import httpx
 import typer
@@ -69,7 +73,6 @@ from sieve.core.selector import (
     build_file_scope,
     is_build_file,
     is_ignorable,
-    recent_ci_runs_sql,
     select_tests,
 )
 from sieve.db import get_sessionmaker
@@ -130,115 +133,217 @@ class Result:
 
 # --- history as of a point in time --------------------------------------------------------
 
-# Runs of the repo strictly before (:at, :run_id). Every history query starts from this.
-_PRIOR = """
-prior AS (
-    SELECT id, ci_run_id, run_attempt, commit_sha, is_main, changed_files_known, variant,
-           COALESCE(started_at, created_at) AS run_at
-    FROM runs
-    WHERE repo_id = :repo_id
-      AND (COALESCE(started_at, created_at), id) < (CAST(:at AS timestamptz), :run_id)
-)
-"""
+
+@dataclass(frozen=True)
+class IndexedRun:
+    id: int
+    ci_key: str  # COALESCE(ci_run_id, 'run:' || id), as in selector.recent_ci_runs_sql
+    run_attempt: int
+    run_at: datetime
+    is_main: bool
+    changed_files_known: bool
+    commit_sha: str
+    variant: str  # '' = no variant
+
+    @property
+    def order(self) -> tuple[datetime, int]:
+        return (self.run_at, self.id)
 
 
-def history_before(
-    session: Session, repo_id: int, run: TargetRun, config: SelectorConfig
-) -> RepoHistory:
-    """What ``load_history`` would have returned just before ``run`` was ingested."""
-    params: dict[str, Any] = {"repo_id": repo_id, "at": run.run_at, "run_id": run.run_id}
-
-    known = session.execute(
-        text(
-            f"""
-            WITH {_PRIOR}, {recent_ci_runs_sql("prior")}
-            SELECT DISTINCT ON (tr.test_id) tr.test_id, tr.file_path
-            FROM test_results tr JOIN recent ON recent.id = tr.run_id
-            ORDER BY tr.test_id, tr.file_path IS NULL, tr.run_id DESC
-            """
-        ),
-        {**params, "n": config.known_test_runs},
-    ).all()
-
-    recent_failures = session.execute(
-        text(
-            f"""
-            WITH {_PRIOR}, {recent_ci_runs_sql("prior", "is_main")}
-            SELECT DISTINCT ON (tr.test_id) tr.test_id, recent.id, recent.commit_sha
-            FROM recent JOIN test_results tr ON tr.run_id = recent.id
-            WHERE tr.status IN ('failed', 'error')
-            ORDER BY tr.test_id, recent.run_at DESC, recent.id DESC
-            """
-        ),
-        {**params, "n": config.recent_main_runs},
-    ).all()
-
-    failed = session.execute(
-        text(
-            f"""
-            WITH {_PRIOR}, {recent_ci_runs_sql("prior", "changed_files_known")}
-            SELECT recent.id, recent.commit_sha, array_agg(DISTINCT tr.test_id)
-            FROM recent JOIN test_results tr ON tr.run_id = recent.id
-            WHERE tr.status IN ('failed', 'error')
-            GROUP BY recent.id, recent.commit_sha, recent.run_at
-            ORDER BY recent.run_at DESC, recent.id DESC
-            """
-        ),
-        {**params, "n": config.co_change_runs},
-    ).all()
-    changed = changed_files_of(session, [row[0] for row in failed])
-
-    return RepoHistory(
-        tests={test_id: KnownTest(test_id, file_path) for test_id, file_path in known},
-        broken_on_main=broken_on_main_before(session, params),
-        recent_main_failures={test_id: (rid, sha) for test_id, rid, sha in recent_failures},
-        failed_runs=tuple(
-            FailedRun(rid, sha, frozenset(changed.get(rid, ())), frozenset(test_ids))
-            for rid, sha, test_ids in failed
-        ),
-    )
+def _bits(mask: int) -> Iterator[int]:
+    """Positions of the set bits of ``mask``, lowest first."""
+    for i, byte in enumerate(mask.to_bytes((mask.bit_length() + 7) // 8, "little")):
+        while byte:
+            low = byte & -byte
+            yield i * 8 + low.bit_length() - 1
+            byte ^= low
 
 
-def broken_on_main_before(session: Session, params: dict[str, Any]) -> dict[str, str]:
-    """Same definition as core/history.py, from main runs before the cutoff only.
+def _set_bit(bitmap: bytearray, bit: int) -> None:
+    byte = bit >> 3
+    if byte >= len(bitmap):
+        bitmap.extend(bytes(byte - len(bitmap) + 256))
+    bitmap[byte] |= 1 << (bit & 7)
 
-    Per variant: a test is broken if any variant's latest main outcome is a failure; the sha
-    is the earliest streak start across broken variants. Only the last
-    ``BROKEN_LOOKBACK_CI_RUNS`` main CI runs are read: the selector only uses *whether* a test
-    is broken (a test whose latest main outcome failed is in those runs), so this changes at
-    most the streak sha in a reason, never which tests are selected. Reading every earlier
-    main run would scan millions of rows per target on a large matrix repo.
+
+class HistoryIndex:
+    """A repo's raw history in memory, to rebuild the selector's history as of any run.
+
+    ``load_history`` reads the *current* history (known tests from test_stats). The eval needs
+    it as of each target, with no peeking, which from SQL means re-reading millions of raw
+    results per target on a matrix repo. So every result is read once here: per run, a bitmask
+    of the tests it reported, the tests that failed, and for main runs each test's final
+    outcome. ``history_before`` then applies the selector's definitions in memory.
     """
-    rows = session.execute(
-        text(
-            f"""
-            WITH {_PRIOR}, {recent_ci_runs_sql("prior", "is_main")}
-            SELECT DISTINCT ON (tr.test_id, recent.id)
-                   tr.test_id, COALESCE(prior.variant, ''), recent.id, recent.run_at,
-                   recent.commit_sha, tr.status
-            FROM recent
-            JOIN prior ON prior.id = recent.id
-            JOIN test_results tr ON tr.run_id = recent.id
-            ORDER BY tr.test_id, recent.id, tr.attempt DESC, tr.id DESC
-            """
-        ),
-        {**params, "n": BROKEN_LOOKBACK_CI_RUNS},
-    ).all()
-    outcomes: dict[tuple[str, str], list[tuple[datetime, int, str, str]]] = defaultdict(list)
-    for test_id, variant, run_id, run_at, sha, status in rows:
-        if status != "skipped":
-            outcomes[(test_id, variant)].append((run_at, run_id, sha, status))
-    starts: dict[str, tuple[datetime, int, str]] = {}
-    for (test_id, _), history in outcomes.items():
-        history.sort(reverse=True)  # newest first
-        streak_start = None
-        for run_at, run_id, sha, status in history:
-            if status not in FAILED:
-                break
-            streak_start = (run_at, run_id, sha)
-        if streak_start is not None and (test_id not in starts or streak_start < starts[test_id]):
-            starts[test_id] = streak_start
-    return {test_id: start[2] for test_id, start in starts.items()}
+
+    def __init__(self, session: Session, repo_id: int) -> None:
+        params = {"repo_id": repo_id}
+        stream = {"yield_per": 100_000}
+        self.runs = sorted(
+            (
+                IndexedRun(*row)
+                for row in session.execute(
+                    text(
+                        """
+                        SELECT id, COALESCE(ci_run_id, 'run:' || id), run_attempt,
+                               COALESCE(started_at, created_at), is_main, changed_files_known,
+                               commit_sha, COALESCE(variant, '')
+                        FROM runs WHERE repo_id = :repo_id
+                        """
+                    ),
+                    params,
+                )
+            ),
+            key=lambda r: r.order,
+        )
+        self._orders = [r.order for r in self.runs]
+        position = {r.id: i for i, r in enumerate(self.runs)}
+        self._tests: list[str] = []
+        bit_of: dict[str, int] = {}
+        seen: dict[int, bytearray] = defaultdict(bytearray)
+        # test bit -> {file path: position of the first run that reported it}
+        paths: dict[int, dict[str, int]] = defaultdict(dict)
+        for run_id, test_id, file_path in session.execute(
+            text(
+                "SELECT tr.run_id, tr.test_id, tr.file_path FROM test_results tr "
+                "JOIN runs ru ON ru.id = tr.run_id WHERE ru.repo_id = :repo_id"
+            ),
+            params,
+            execution_options=stream,
+        ):
+            bit = bit_of.get(test_id)
+            if bit is None:
+                bit = bit_of[test_id] = len(self._tests)
+                self._tests.append(test_id)
+            _set_bit(seen[run_id], bit)
+            if file_path:
+                pos, first = position[run_id], paths[bit].get(file_path)
+                if first is None or pos < first:
+                    paths[bit][file_path] = pos
+        self._seen = {run_id: int.from_bytes(b, "little") for run_id, b in seen.items()}
+        self._paths = dict(paths)
+
+        # Any failed/error result (all attempts), as the selector's failure queries read them.
+        self._failed: dict[int, set[str]] = defaultdict(set)
+        for run_id, test_id in session.execute(
+            text(
+                "SELECT tr.run_id, tr.test_id FROM test_results tr "
+                "JOIN runs ru ON ru.id = tr.run_id "
+                "WHERE ru.repo_id = :repo_id AND tr.status IN ('failed', 'error')"
+            ),
+            params,
+        ):
+            self._failed[run_id].add(test_id)
+
+        # Main runs: each test's final outcome (non-skipped), for broken-on-main.
+        main_failed: dict[int, bytearray] = defaultdict(bytearray)
+        main_passed: dict[int, bytearray] = defaultdict(bytearray)
+        for run_id, test_id, status in session.execute(
+            text(
+                """
+                SELECT DISTINCT ON (tr.run_id, tr.test_id) tr.run_id, tr.test_id, tr.status
+                FROM test_results tr JOIN runs ru ON ru.id = tr.run_id
+                WHERE ru.repo_id = :repo_id AND ru.is_main
+                ORDER BY tr.run_id, tr.test_id, tr.attempt DESC, tr.id DESC
+                """
+            ),
+            params,
+            execution_options=stream,
+        ):
+            if status in FAILED:
+                _set_bit(main_failed[run_id], bit_of[test_id])
+            elif status == "passed":
+                _set_bit(main_passed[run_id], bit_of[test_id])
+        self._main_failed = {r: int.from_bytes(b, "little") for r, b in main_failed.items()}
+        self._main_passed = {r: int.from_bytes(b, "little") for r, b in main_passed.items()}
+
+        self._changed = changed_files_of(session, [r.id for r in self.runs])
+
+    def __str__(self) -> str:
+        return f"{len(self.runs)} runs, {len(self._tests)} tests"
+
+    def history_before(self, run: TargetRun, config: SelectorConfig) -> RepoHistory:
+        """What ``load_history`` would have returned just before ``run`` was ingested.
+
+        Only runs strictly earlier than ``run`` by (run time, id) count. Known tests are those
+        in any of the latest ``known_test_runs`` CI runs, which is what test_stats' last-seen
+        run encodes for ``load_history``.
+        """
+        prior = self.runs[: bisect.bisect_left(self._orders, (run.run_at, run.run_id))]
+
+        def recent(n: int, keep: Callable[[IndexedRun], bool]) -> list[IndexedRun]:
+            """Runs of the latest ``n`` CI runs among ``prior``, newest first."""
+            groups: dict[tuple[str, int], list[IndexedRun]] = defaultdict(list)
+            for r in prior:
+                if keep(r):
+                    groups[(r.ci_key, r.run_attempt)].append(r)
+            latest = sorted(
+                groups.values(),
+                key=lambda g: (max(r.run_at for r in g), max(r.id for r in g)),
+                reverse=True,
+            )[:n]
+            return sorted((r for g in latest for r in g), key=lambda r: r.order, reverse=True)
+
+        mask = 0
+        for r in recent(config.known_test_runs, lambda r: True):
+            mask |= self._seen.get(r.id, 0)
+        cutoff = len(prior)
+        tests = {}
+        for bit in _bits(mask):
+            test_id = self._tests[bit]
+            reported = [(pos, p) for p, pos in self._paths.get(bit, {}).items() if pos < cutoff]
+            tests[test_id] = KnownTest(test_id, max(reported)[1] if reported else None)
+
+        recent_main_failures: dict[str, tuple[int, str]] = {}
+        for r in recent(config.recent_main_runs, lambda r: r.is_main):
+            for test_id in self._failed.get(r.id, ()):
+                recent_main_failures.setdefault(test_id, (r.id, r.commit_sha))
+
+        failed_runs = tuple(
+            FailedRun(r.id, r.commit_sha, frozenset(self._changed.get(r.id, ())),
+                      frozenset(self._failed[r.id]))
+            for r in recent(config.co_change_runs, lambda r: r.changed_files_known)
+            if r.id in self._failed
+        )  # fmt: skip
+
+        return RepoHistory(
+            tests=tests,
+            broken_on_main=self._broken_on_main(
+                recent(BROKEN_LOOKBACK_CI_RUNS, lambda r: r.is_main)
+            ),
+            recent_main_failures=recent_main_failures,
+            failed_runs=failed_runs,
+        )
+
+    def _broken_on_main(self, main_runs: list[IndexedRun]) -> dict[str, str]:
+        """Same definition as core/history.py, from ``main_runs`` (newest first) only.
+
+        Per variant, a test is broken if its latest non-skipped outcome is a failure; its
+        streak starts at the oldest failure before a pass. The sha is the earliest start
+        across broken variants. Only the last ``BROKEN_LOOKBACK_CI_RUNS`` main CI runs are
+        read: the selector only uses *whether* a test is broken, so a shorter lookback
+        changes at most the streak sha in a reason, never which tests are selected.
+        """
+        by_variant: dict[str, list[IndexedRun]] = defaultdict(list)
+        for r in main_runs:
+            by_variant[r.variant].append(r)
+        starts: dict[str, tuple[datetime, int, str]] = {}
+        for runs in by_variant.values():
+            decided = alive = 0  # tests with a newer outcome / still in a failing streak
+            streak_start: dict[int, IndexedRun] = {}
+            for r in runs:  # newest first
+                failed = self._main_failed.get(r.id, 0)
+                passed = self._main_passed.get(r.id, 0)
+                alive |= failed & ~decided  # its latest outcome is a failure
+                alive &= ~passed  # an older pass ends the streak
+                for bit in _bits(failed & alive):
+                    streak_start[bit] = r
+                decided |= failed | passed
+            for bit, r in streak_start.items():
+                test_id, start = self._tests[bit], (r.run_at, r.id, r.commit_sha)
+                if test_id not in starts or start < starts[test_id]:
+                    starts[test_id] = start
+        return {test_id: start[2] for test_id, start in starts.items()}
 
 
 def changed_files_of(session: Session, run_ids: list[int]) -> dict[int, set[str]]:
@@ -589,14 +694,14 @@ def skipped_pcts(
 
 def evaluate(
     session: Session,
-    repo_id: int,
+    index: HistoryIndex,
     run: TargetRun,
     config: SelectorConfig,
     graphs: GraphProvider,
     durations: dict[str, float],
     go: bool,
 ) -> Result:
-    history = history_before(session, repo_id, run, config)
+    history = index.history_before(run, config)
     known = run.changed_files is not None
     changed = list(run.changed_files or ())
     if not known:
@@ -834,12 +939,15 @@ def main(
         rules = f"{len(config.depends)} declared rule(s)" if config.depends else "no declared rules"
         graph = ("go list" if is_go else "python imports (misses only)") if checkout else "none"
         typer.echo(f"# {repo} ({'go' if is_go else 'python'}): {rules}; import graph: {graph}")
+        started = time.perf_counter()
+        index = HistoryIndex(session, repo_id)
+        typer.echo(f"history index: {index} in {time.perf_counter() - started:.0f}s", err=True)
 
         def run_all(title: str, targets: list[TargetRun]) -> list[Result]:
             typer.echo(f"\n# {title}")
             results = []
             for target in targets:
-                result = evaluate(session, repo_id, target, config, graphs, durations, is_go)
+                result = evaluate(session, index, target, config, graphs, durations, is_go)
                 print_result(result, verbose)
                 results.append(result)
             return results

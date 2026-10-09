@@ -65,6 +65,13 @@ cp .env.example .env
 
 uv run alembic upgrade head
 uv run uvicorn sieve.api.main:app --reload
+```
+
+Upgrading an existing database past migration 0005: run `POST /repos/{repo}/rollup` for each
+repo afterwards. `/select` reads known tests from `test_stats`, so until the rollup fills the
+new columns the repo has no known tests and `/select` returns the full suite.
+
+```sh
 
 uv run ruff check && uv run ruff format --check
 uv run mypy src tests scripts

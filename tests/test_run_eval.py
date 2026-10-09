@@ -22,6 +22,7 @@ from sieve.core.selector import (
     SelectedTest,
     Selection,
     SelectorConfig,
+    load_history,
 )
 
 PKG = "github.com/acme/shop/cart"
@@ -228,8 +229,45 @@ def test_history_before_excludes_later_runs_and_sibling_variants(db_session: Ses
     ).scalar_one()
     target = next(t for t in ev.pr_targets(db_session, repo_id, 10, False) if t.ci_run_id == "2")
 
-    hist = ev.history_before(db_session, repo_id, target, SelectorConfig())
+    hist = ev.HistoryIndex(db_session, repo_id).history_before(target, SelectorConfig())
 
     # Only CI run 1 happened before CI run 2: neither its own variants nor run 3 leak in.
     assert set(hist.tests) == {"t::early"}
     assert hist.failed_runs == ()
+
+
+S = Status.SKIPPED
+
+
+def test_history_index_matches_load_history_after_the_last_run(db_session: Session) -> None:
+    # Matrix CI runs on main and branches; a test broken on main on one variant only, a test
+    # that recovers, one only skipped lately, and one that stopped appearing.
+    ingest(db_session, 1, 1, {"t::a": P, "t::b": F, "t::gone": P}, variant="linux", is_main=True)
+    ingest(db_session, 1, 1, {"t::a": P, "t::b": P, "t::gone": P}, variant="macos", is_main=True)
+    ingest(db_session, 2, 2, {"t::a": F, "t::b": F, "t::c": P}, variant="linux")
+    ingest(db_session, 3, 3, {"t::a": P, "t::b": F, "t::c": S}, variant="linux", is_main=True)
+    ingest(db_session, 3, 3, {"t::a": F, "t::b": P, "t::c": S}, variant="macos", is_main=True)
+    ingest(db_session, 4, 4, {"t::a": P, "t::b": F, "t::c": P}, variant="linux", is_main=True)
+    repo_id = db_session.execute(
+        text("SELECT id FROM repos WHERE name = :n"), {"n": REPO}
+    ).scalar_one()
+    config = SelectorConfig(known_test_runs=3, recent_main_runs=2)
+    after_everything = ev.TargetRun(10**9, None, "f" * 40, "x", T0 + timedelta(days=1))
+
+    from_index = ev.HistoryIndex(db_session, repo_id).history_before(after_everything, config)
+    from_db = load_history(db_session, REPO, config)
+
+    assert from_db is not None
+    assert set(from_index.tests) == set(from_db.tests) == {"t::a", "t::b", "t::c"}
+    # b: failing on linux main since commit 1; a: its latest macos main result failed (3).
+    assert (
+        from_index.broken_on_main
+        == from_db.broken_on_main
+        == {
+            "t::a": f"{3:040x}",
+            "t::b": f"{1:040x}",
+        }
+    )
+    assert from_index.recent_main_failures == from_db.recent_main_failures
+    assert set(from_index.recent_main_failures) == {"t::a", "t::b"}
+    assert from_index.failed_runs == tuple(from_db.failed_runs)

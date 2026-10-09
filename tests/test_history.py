@@ -409,6 +409,59 @@ def test_rollup_reads_only_the_window_not_old_history(db_session: Session) -> No
     assert stats(db_session, "t::case0").runs == 2
 
 
+def test_run_rollup_reads_the_runs_test_list_once(db_session: Session) -> None:
+    # The run's test list used to be an IN (subquery) on test_results that the planner could
+    # run as a nested loop, re-reading the run's results once per result row in the window.
+    # Push the planner into that shape (old SQL: 5,100 rows read here); the list must still be
+    # read once.
+    tests: dict[str, Status | Sequence[Status]] = {f"t::case{i}": P for i in range(30)}
+    newest = None
+    for n in range(1, 11):
+        newest = ingest(db_session, commit=n, hour=n, tests=tests)
+    assert newest is not None
+    for setting in ("hashjoin", "mergejoin", "hashagg", "material", "sort"):
+        db_session.execute(text(f"SET LOCAL enable_{setting} = off"))
+
+    plan = db_session.execute(
+        text("EXPLAIN (ANALYZE, FORMAT JSON) " + str(history._RUN_ROLLUP_SQL)),
+        {"repo_id": newest.repo_id, "run_id": newest.id, "window_days": 90},
+    ).scalar_one()[0]["Plan"]
+
+    window_rows, run_rows = 10 * len(tests), len(tests)
+    assert _rows_read_from(plan, "test_results") <= window_rows + run_rows  # not 300 x 30
+
+
+# --- last seen (the selector's known tests) -----------------------------------------------
+
+
+def test_last_seen_follows_ci_run_order(db_session: Session) -> None:
+    # CI run A's legs ran at hours 1 and 5; CI run B ran at hour 4. t::a appeared in A's first
+    # leg and in B. CI runs are ordered by their latest leg, so A (5) is newer than B (4):
+    # that's the CI run the selector's "latest N CI runs" window sees first.
+    a1 = ingest(db_session, commit=1, hour=1, tests={"t::a": P}, ci_run_id="A", variant="x")
+    a2 = ingest(db_session, commit=1, hour=5, tests={"t::b": P}, ci_run_id="A", variant="y")
+    ingest(db_session, commit=2, hour=4, tests={"t::a": F}, ci_run_id="B")
+
+    s = stats(db_session)
+    assert s.last_seen_run_id == a1.id
+    assert s.last_seen_at == at(4)  # the latest run time it appeared, in B
+    assert stats(db_session, "t::b").last_seen_run_id == a2.id
+
+    # The batch rollup computes the same.
+    db_session.execute(update(TestStats).values(last_seen_run_id=None, last_seen_at=None))
+    history.recompute_repo_stats(db_session, a1.repo_id, 90)
+    db_session.expire_all()
+    assert (stats(db_session).last_seen_run_id, stats(db_session).last_seen_at) == (a1.id, at(4))
+
+
+def test_last_seen_includes_skipped_results(db_session: Session) -> None:
+    ingest(db_session, commit=1, hour=1, tests={"t::a": P})
+    newest = ingest(db_session, commit=2, hour=2, tests={"t::a": S})
+
+    s = stats(db_session)
+    assert (s.last_seen_run_id, s.last_seen_at) == (newest.id, at(2))
+
+
 # --- out-of-order (backfill) ingest -------------------------------------------------------
 
 

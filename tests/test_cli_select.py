@@ -9,10 +9,10 @@ import pytest
 import respx
 from typer.testing import CliRunner, Result
 
-from sieve.cli.main import app, parse_deleted, parse_name_status
+from siftwise.cli.main import app, parse_deleted, parse_name_status
 from tests.gofixture import M, go_list_packages
 
-SERVER = "http://sieve.test"
+SERVER = "http://siftwise.test"
 SELECT_URL = f"{SERVER}/select"
 
 
@@ -55,7 +55,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture(autouse=True)
 def token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SIEVE_API_TOKEN", "cli-token")
+    monkeypatch.setenv("SIFTWISE_API_TOKEN", "cli-token")
 
 
 @pytest.fixture
@@ -98,7 +98,9 @@ def test_prints_command_for_branch_diff(api: respx.MockRouter) -> None:
 
     assert result.exit_code == 0, result.output
     assert result.stdout == "pytest tests/test_cart.py::test_total\n"
-    assert result.stderr == "sieve: selective (2 of 10 known tests): 2 of 10 known tests selected\n"
+    assert (
+        result.stderr == "siftwise: selective (2 of 10 known tests): 2 of 10 known tests selected\n"
+    )
     request = route.calls.last.request
     assert request.headers["authorization"] == "Bearer cli-token"
     assert sent(route) == {
@@ -112,7 +114,7 @@ def test_prints_command_for_branch_diff(api: respx.MockRouter) -> None:
             "src/with space.py",
         ],
         "changed_files_known": True,
-        # No .sieve.toml and no go.mod: empty rules, no go_module or affected_packages.
+        # No .siftwise.toml and no go.mod: empty rules, no go_module or affected_packages.
         "depends": [],
         "always_run": [],
         # The deleted file and the old side of the rename: never named in a command.
@@ -151,7 +153,7 @@ def test_no_tests_affected_prints_message_and_exits_0(api: respx.MockRouter) -> 
     result = run()
 
     assert result.exit_code == 0
-    assert result.stdout == ""  # `eval "$(sieve select ...)"` runs nothing
+    assert result.stdout == ""  # `eval "$(siftwise select ...)"` runs nothing
     assert "no tests affected" in result.stderr
 
 
@@ -166,12 +168,12 @@ def test_full_mode_prints_full_command(api: respx.MockRouter) -> None:
 
     assert result.exit_code == 0
     assert result.stdout == "go test ./...\n"
-    assert "sieve: full" in result.stderr and "go.mod" in result.stderr
+    assert "siftwise: full" in result.stderr and "go.mod" in result.stderr
 
 
 @pytest.mark.usefixtures("repo")
 def test_full_mode_without_a_command_fails(api: respx.MockRouter) -> None:
-    # e.g. a Java-only history: the full suite is needed but sieve can't name the command.
+    # e.g. a Java-only history: the full suite is needed but siftwise can't name the command.
     api.post(SELECT_URL).respond(json=response(mode="full", reason="x", command="", commands=[]))
 
     result = run()
@@ -213,7 +215,7 @@ def test_missing_git_sends_changed_files_unknown(
     def no_git(*args: object, **kwargs: object) -> None:
         raise FileNotFoundError("git")
 
-    monkeypatch.setattr("sieve.cli.main.subprocess.run", no_git)
+    monkeypatch.setattr("siftwise.cli.main.subprocess.run", no_git)
     route = api.post(SELECT_URL).respond(json=response(mode="full"))
 
     result = run()
@@ -230,11 +232,11 @@ def test_missing_git_sends_changed_files_unknown(
     ("api_response", "message"),
     [
         (httpx.Response(404, json={"detail": "unknown repo 'acme/shop'"}),
-         "sieve returned 404: unknown repo 'acme/shop'"),
+         "siftwise returned 404: unknown repo 'acme/shop'"),
         (httpx.Response(401, json={"detail": "invalid or missing bearer token"}),
-         "sieve returned 401: invalid or missing bearer token"),
-        (httpx.Response(502, text="Bad Gateway"), "sieve returned 502: Bad Gateway"),
-        (httpx.ConnectError("refused"), f"could not reach sieve at {SERVER}"),
+         "siftwise returned 401: invalid or missing bearer token"),
+        (httpx.Response(502, text="Bad Gateway"), "siftwise returned 502: Bad Gateway"),
+        (httpx.ConnectError("refused"), f"could not reach siftwise at {SERVER}"),
     ],
     ids=["unknown-repo", "bad-token", "server-error", "unreachable"],
 )  # fmt: skip
@@ -251,15 +253,15 @@ def test_api_errors_exit_1(
 
 
 def test_missing_token_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SIEVE_API_TOKEN")
+    monkeypatch.delenv("SIFTWISE_API_TOKEN")
     result = run()
     assert result.exit_code == 2
-    assert "SIEVE_API_TOKEN" in result.stderr
+    assert "SIFTWISE_API_TOKEN" in result.stderr
 
 
-# --- Go import graph and .sieve.toml ------------------------------------------------------
+# --- Go import graph and .siftwise.toml ------------------------------------------------------
 
-SIEVE_TOML = """
+SIFTWISE_TOML = """
 always_run = ["smoke/**"]
 
 [[depends]]
@@ -276,7 +278,7 @@ def go_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     git(tmp_path, "config", "user.name", "Test")
     git(tmp_path, "config", "commit.gpgsign", "false")
     (tmp_path / "go.mod").write_text(f"module {M}\n\ngo 1.24\n")
-    (tmp_path / ".sieve.toml").write_text(SIEVE_TOML)
+    (tmp_path / ".siftwise.toml").write_text(SIFTWISE_TOML)
     (tmp_path / "a").mkdir()
     (tmp_path / "a" / "a.go").write_text("package a\n")
     git(tmp_path, "add", "-A")
@@ -297,7 +299,7 @@ def test_go_dependents_and_repo_config_are_sent(
         roots.append(root)
         return go_list_packages(root)
 
-    monkeypatch.setattr("sieve.cli.main.run_go_list", fake_go_list)
+    monkeypatch.setattr("siftwise.cli.main.run_go_list", fake_go_list)
     route = api.post(SELECT_URL).respond(json=response())
 
     result = run()
@@ -321,7 +323,7 @@ def test_go_dependents_and_repo_config_are_sent(
 def test_go_list_failure_sends_no_dependents(
     api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("sieve.cli.main.run_go_list", lambda root: None)
+    monkeypatch.setattr("siftwise.cli.main.run_go_list", lambda root: None)
     route = api.post(SELECT_URL).respond(json=response())
 
     result = run()
@@ -336,7 +338,7 @@ def test_no_go_list_option(api: respx.MockRouter, monkeypatch: pytest.MonkeyPatc
     def must_not_run(root: Path) -> None:
         raise AssertionError("go list should not run")
 
-    monkeypatch.setattr("sieve.cli.main.run_go_list", must_not_run)
+    monkeypatch.setattr("siftwise.cli.main.run_go_list", must_not_run)
     route = api.post(SELECT_URL).respond(json=response())
 
     run("--no-go-list")
@@ -348,7 +350,7 @@ def test_no_go_list_option(api: respx.MockRouter, monkeypatch: pytest.MonkeyPatc
 def test_go_list_skipped_when_diff_unknown(
     go_repo: Path, api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("sieve.cli.main.run_go_list", lambda root: pytest.fail("ran go list"))
+    monkeypatch.setattr("siftwise.cli.main.run_go_list", lambda root: pytest.fail("ran go list"))
     route = api.post(SELECT_URL).respond(json=response(mode="full"))
 
     run("--base", "no-such-branch")
@@ -358,8 +360,8 @@ def test_go_list_skipped_when_diff_unknown(
 
 
 @pytest.mark.usefixtures("go_repo")
-def test_invalid_sieve_toml_exits_2(api: respx.MockRouter) -> None:
-    Path(".sieve.toml").write_text('[[depends]]\ntests = "e2e/**"\non = []\n')
+def test_invalid_siftwise_toml_exits_2(api: respx.MockRouter) -> None:
+    Path(".siftwise.toml").write_text('[[depends]]\ntests = "e2e/**"\non = []\n')
     route = api.post(SELECT_URL).respond(json=response())
 
     result = run()
@@ -452,7 +454,7 @@ def test_python_graph_failure_sends_no_importers(
     def broken(root: Path) -> None:
         raise OSError("disk on fire")
 
-    monkeypatch.setattr("sieve.cli.main.build_py_graph", broken)
+    monkeypatch.setattr("siftwise.cli.main.build_py_graph", broken)
     route = api.post(SELECT_URL).respond(json=response())
 
     result = run()
@@ -464,7 +466,7 @@ def test_python_graph_failure_sends_no_importers(
 
 @pytest.mark.usefixtures("py_repo")
 def test_no_py_imports_option(api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("sieve.cli.main.build_py_graph", lambda root: pytest.fail("built graph"))
+    monkeypatch.setattr("siftwise.cli.main.build_py_graph", lambda root: pytest.fail("built graph"))
     route = api.post(SELECT_URL).respond(json=response())
 
     run("--no-py-imports")
@@ -475,7 +477,7 @@ def test_no_py_imports_option(api: respx.MockRouter, monkeypatch: pytest.MonkeyP
 def test_python_graph_skipped_without_python_changes(
     py_repo: Path, api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("sieve.cli.main.build_py_graph", lambda root: pytest.fail("built graph"))
+    monkeypatch.setattr("siftwise.cli.main.build_py_graph", lambda root: pytest.fail("built graph"))
     route = api.post(SELECT_URL).respond(json=response())
     (py_repo / "README.md").write_text("docs\n")
     git(py_repo, "add", "-A")

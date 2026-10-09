@@ -1,4 +1,4 @@
-"""The repo's ``.sieve.toml``: selection settings the CLI sends with each request.
+"""The repo's ``.siftwise.toml``: selection settings the CLI sends with each request.
 
 always_run = ["tests/smoke/**"]
 
@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sieve.core.selector import DependsRule
+from siftwise.core.selector import DependsRule
 
-FILE_NAME = ".sieve.toml"
+FILE_NAME = ".siftwise.toml"
 
 
 class RepoConfigError(ValueError):

@@ -4,7 +4,7 @@
 adjusted), so the rollup is independent of ingest order: backfilling old runs after newer ones
 gives the same stats.
 
-The rollup reads a **window**: runs from the ``SIEVE_STATS_WINDOW_DAYS`` days (default 90; 0 =
+The rollup reads a **window**: runs from the ``SIFTWISE_STATS_WINDOW_DAYS`` days (default 90; 0 =
 all history) up to the repo's most recent run. Anchoring on the newest run rather than "now"
 keeps backfilled history meaningful. Reading is driven by the window's runs (results are
 fetched by ``run_id``), so ingest cost depends on how much happened in the window, not on how
@@ -47,7 +47,7 @@ runs, ``test_stats`` is stale.
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from sieve.core.models import Repo, Run, TestResult, TestStats
+from siftwise.core.models import Repo, Run, TestResult, TestStats
 
 # First key of the two-int advisory lock, so other advisory-lock users can't collide with it.
 _ROLLUP_LOCK_NAMESPACE = 1

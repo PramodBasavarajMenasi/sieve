@@ -18,12 +18,12 @@ from fastapi import (
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
-from sieve.api.deps import get_app_settings
-from sieve.config import Settings
-from sieve.core.ingest import count_results, create_run, find_existing_run, find_run
-from sieve.core.junit import JUnitParseError, ParsedTestResult, parse_junit
-from sieve.core.schemas import RunLookupResponse, RunMetadata, RunResponse
-from sieve.db import get_session
+from siftwise.api.deps import get_app_settings
+from siftwise.config import Settings
+from siftwise.core.ingest import count_results, create_run, find_existing_run, find_run
+from siftwise.core.junit import JUnitParseError, ParsedTestResult, parse_junit
+from siftwise.core.schemas import RunLookupResponse, RunMetadata, RunResponse
+from siftwise.db import get_session
 
 # Auth is enforced by BearerAuthMiddleware, before the request body is read.
 router = APIRouter()

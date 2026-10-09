@@ -9,11 +9,11 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scripts.eval import run_eval as ev
-from sieve.cli.pygraph import PyGraph
-from sieve.core.ingest import create_run
-from sieve.core.junit import ParsedTestResult, Status
-from sieve.core.schemas import RunMetadata
-from sieve.core.selector import (
+from siftwise.cli.pygraph import PyGraph
+from siftwise.core.ingest import create_run
+from siftwise.core.junit import ParsedTestResult, Status
+from siftwise.core.schemas import RunMetadata
+from siftwise.core.selector import (
     FailedRun,
     KnownTest,
     Mode,
@@ -149,7 +149,7 @@ def test_missing_python_graph(tmp_path: Path) -> None:
 def test_go_miss_outside_the_import_graph_needs_a_declared_dependency(
     graphs: ev.GraphProvider,
 ) -> None:
-    from sieve.cli.gograph import GoGraph
+    from siftwise.cli.gograph import GoGraph
 
     go_graph = GoGraph("github.com/acme/shop", {}, {})
     test_id = "github.com/acme/shop/e2e::TestCheckout"

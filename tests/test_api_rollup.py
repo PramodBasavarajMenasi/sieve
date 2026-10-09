@@ -10,10 +10,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from sieve.api.main import create_app
-from sieve.config import Settings
-from sieve.core.models import TestStats
-from sieve.db import get_session
+from siftwise.api.main import create_app
+from siftwise.config import Settings
+from siftwise.core.models import TestStats
+from siftwise.db import get_session
 
 TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}

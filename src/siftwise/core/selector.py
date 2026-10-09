@@ -64,7 +64,7 @@ from enum import StrEnum
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from sieve.core.junit import normalize_path
+from siftwise.core.junit import normalize_path
 
 
 class Mode(StrEnum):
@@ -156,13 +156,13 @@ class SelectorConfig:
     # Go module path (e.g. "github.com/ipfs/kubo"). When set, Go commands use ./relative
     # package dirs and root-package changes can be mapped; otherwise import paths are used.
     go_module: str | None = None
-    # Declared dependencies from the repo's .sieve.toml.
+    # Declared dependencies from the repo's .siftwise.toml.
     depends: tuple[DependsRule, ...] = ()
 
 
 @dataclass(frozen=True)
 class DependsRule:
-    """``[[depends]]`` in .sieve.toml: tests matching ``tests`` depend on files matching ``on``.
+    """``[[depends]]`` in .siftwise.toml: tests matching ``tests`` depend on files matching ``on``.
 
     Globs support ``*`` (within a path segment), ``**`` (any number of segments) and ``?``.
     Patterns in ``on`` starting with ``!`` exclude files. ``tests`` is matched against a
@@ -406,7 +406,7 @@ def select_tests(
             whole_packages.add(test.classname)
             covered_by_dependents.update(imported)
 
-    # Declared dependencies (.sieve.toml [[depends]]).
+    # Declared dependencies (.siftwise.toml [[depends]]).
     covered_by_rules: set[str] = set()
     for rule in config.depends:
         triggers = [p for p in relevant if rule.matches_file(p)]

@@ -35,7 +35,7 @@ class BearerAuthMiddleware:
 
         if self.token is None:
             response = JSONResponse(
-                {"detail": "server has no SIEVE_API_TOKEN configured"}, status_code=503
+                {"detail": "server has no SIFTWISE_API_TOKEN configured"}, status_code=503
             )
         elif _is_valid_bearer(Headers(scope=scope).get("authorization", ""), self.token):
             await self.app(scope, receive, send)

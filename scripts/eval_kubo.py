@@ -1,6 +1,6 @@
 """ipfs/kubo preset for ``scripts/eval/run_eval.py`` (kept so existing kubo commands work).
 
-    uv run python scripts/eval_kubo.py --failing --sieve-toml scripts/eval/kubo.sieve.toml
+    uv run python scripts/eval_kubo.py --failing --siftwise-toml scripts/eval/kubo.siftwise.toml
     uv run python scripts/eval_kubo.py --replay-main --kubo-checkout ../kubo --go go
 
 Equivalent to ``python -m scripts.eval.run_eval --repo ipfs/kubo --go-module
@@ -30,7 +30,7 @@ def main(
         bool, typer.Option("--replay-main", help="Treat each main run as a PR.")
     ] = False,
     go_module: Annotated[str, typer.Option(help="Go module path.")] = "github.com/ipfs/kubo",
-    sieve_toml: Annotated[
+    siftwise_toml: Annotated[
         Path | None, typer.Option(help="Repo config with [[depends]] / always_run.")
     ] = None,
     kubo_checkout: Annotated[
@@ -49,7 +49,7 @@ def main(
         replay_main=replay_main,
         language="go",
         go_module=go_module,
-        sieve_toml=sieve_toml,
+        siftwise_toml=siftwise_toml,
         checkout=kubo_checkout,
         go=go,
         cache_dir=cache_dir,

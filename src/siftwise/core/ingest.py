@@ -8,10 +8,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from sieve.core.history import recompute_test_stats
-from sieve.core.junit import ParsedTestResult
-from sieve.core.models import RUN_UNIQUE_INDEX, ChangedFile, Repo, Run, TestResult
-from sieve.core.schemas import RunMetadata, StatusCounts
+from siftwise.core.history import recompute_test_stats
+from siftwise.core.junit import ParsedTestResult
+from siftwise.core.models import RUN_UNIQUE_INDEX, ChangedFile, Repo, Run, TestResult
+from siftwise.core.schemas import RunMetadata, StatusCounts
 
 
 def find_run(

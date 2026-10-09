@@ -2,14 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from sieve.cli.repoconfig import (
+from siftwise.cli.repoconfig import (
     RepoConfig,
     RepoConfigError,
     load_repo_config,
     parse_repo_config,
     read_go_module,
 )
-from sieve.core.selector import DependsRule
+from siftwise.core.selector import DependsRule
 
 KUBO_CONFIG = """
 always_run = ["test/cli/smoke/**"]
@@ -25,7 +25,7 @@ on = "src/**"
 
 
 def test_load_repo_config(tmp_path: Path) -> None:
-    path = tmp_path / ".sieve.toml"
+    path = tmp_path / ".siftwise.toml"
     path.write_text(KUBO_CONFIG)
 
     assert load_repo_config(path) == RepoConfig(
@@ -60,9 +60,9 @@ def test_invalid_config(data: dict[str, object], message: str) -> None:
 
 
 def test_invalid_toml(tmp_path: Path) -> None:
-    path = tmp_path / ".sieve.toml"
+    path = tmp_path / ".siftwise.toml"
     path.write_text("[[depends]\n")
-    with pytest.raises(RepoConfigError, match=r"\.sieve\.toml"):
+    with pytest.raises(RepoConfigError, match=r"\.siftwise\.toml"):
         load_repo_config(path)
 
 

@@ -9,15 +9,15 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select, text, update
 from sqlalchemy.orm import Session
 
-from sieve.api.main import create_app
-from sieve.config import Settings
-from sieve.core import history
-from sieve.core.history import get_test_stats
-from sieve.core.ingest import create_run
-from sieve.core.junit import ParsedTestResult, Status
-from sieve.core.models import Run, TestResult, TestStats
-from sieve.core.schemas import RunMetadata
-from sieve.db import get_session
+from siftwise.api.main import create_app
+from siftwise.config import Settings
+from siftwise.core import history
+from siftwise.core.history import get_test_stats
+from siftwise.core.ingest import create_run
+from siftwise.core.junit import ParsedTestResult, Status
+from siftwise.core.models import Run, TestResult, TestStats
+from siftwise.core.schemas import RunMetadata
+from siftwise.db import get_session
 
 REPO = "acme/shop"
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
@@ -573,7 +573,7 @@ def test_run_is_not_committed_if_rollup_fails(
     def boom(*args: object) -> None:
         raise RuntimeError("rollup failed")
 
-    monkeypatch.setattr("sieve.core.ingest.recompute_test_stats", boom)
+    monkeypatch.setattr("siftwise.core.ingest.recompute_test_stats", boom)
     with pytest.raises(RuntimeError, match="rollup failed"):
         ingest(db_session, commit=1, hour=1, tests={"t::a": P})
     db_session.rollback()
@@ -682,7 +682,7 @@ def test_duplicate_upload_race_does_not_double_count(
 
     assert upload() == 201
     # Lose the race: the pre-check misses and the insert hits the unique constraint.
-    monkeypatch.setattr("sieve.api.routes.runs.find_existing_run", lambda session, meta: None)
+    monkeypatch.setattr("siftwise.api.routes.runs.find_existing_run", lambda session, meta: None)
     assert upload() == 200
 
     assert stats(db_session).runs == 1

@@ -1,10 +1,10 @@
-"""Backfill sieve history from a GitHub repo's past Actions runs.
+"""Backfill siftwise history from a GitHub repo's past Actions runs.
 
 For each completed workflow run, downloads the JUnit artifacts, extracts the ``*.xml`` files and
-uploads them to ``POST /runs``. Safe to re-run: runs sieve already has (``GET /runs/lookup``)
+uploads them to ``POST /runs``. Safe to re-run: runs siftwise already has (``GET /runs/lookup``)
 are skipped before anything is downloaded.
 
-    GITHUB_TOKEN=... SIEVE_API_TOKEN=... uv run python scripts/backfill.py --repo acme/shop
+    GITHUB_TOKEN=... SIFTWISE_API_TOKEN=... uv run python scripts/backfill.py --repo acme/shop
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ class GitHubClient:
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "sieve-backfill",
+                "User-Agent": "siftwise-backfill",
             },
             # Artifact downloads redirect to blob storage. httpx drops the Authorization
             # header on cross-origin redirects, so the token is not sent there.
@@ -189,7 +189,7 @@ class GitHubClient:
     def changed_files(self, repo: str, run: Json) -> tuple[list[str], bool]:
         """``(paths, known)``: the files this run's change touched.
 
-        The range matches what ``sieve select`` diffs for the same change:
+        The range matches what ``siftwise select`` diffs for the same change:
 
         * ``pull_request``: the PR's base sha ... head sha (the whole PR, not just its last
           commit).
@@ -347,10 +347,10 @@ class GitHubClient:
         return float(self._backoff_seconds * 2**attempt)
 
 
-# --- sieve --------------------------------------------------------------------------------
+# --- siftwise --------------------------------------------------------------------------------
 
 
-class SieveClient:
+class SiftwiseClient:
     def __init__(self, server: str, token: str, *, defer_rollup: bool = False) -> None:
         # Batch mode: uploads skip the per-run stats rollup; call rollup() once at the end.
         self.defer_rollup = defer_rollup
@@ -372,7 +372,7 @@ class SieveClient:
     def lookup(
         self, repo: str, ci_run_id: str, run_attempt: int, variant: str | None = None
     ) -> Json | None:
-        """The stored run for this CI run attempt and variant, or None if sieve lacks it."""
+        """The stored run for this CI run attempt and variant, or None if siftwise lacks it."""
         params: dict[str, str | int] = {
             "repo": repo,
             "ci_run_id": ci_run_id,
@@ -499,7 +499,7 @@ def artifact_variants(names: list[str], pattern: str) -> dict[str, str]:
 
 def backfill_run(
     github: GitHubClient,
-    sieve: SieveClient,
+    siftwise: SiftwiseClient,
     repo: str,
     run: Json,
     default_branch: str,
@@ -529,7 +529,7 @@ def backfill_run(
         variant = variants[artifact["name"]]
         try:
             outcome, detail = _backfill_artifact(
-                github, sieve, repo, run, default_branch, artifact, variant, changed_files
+                github, siftwise, repo, run, default_branch, artifact, variant, changed_files
             )
         except (httpx.HTTPError, zipfile.BadZipFile, BackfillError) as exc:
             outcome, detail = Outcome.ERROR, f"{type(exc).__name__}: {exc}"
@@ -539,7 +539,7 @@ def backfill_run(
 
 def _backfill_artifact(
     github: GitHubClient,
-    sieve: SieveClient,
+    siftwise: SiftwiseClient,
     repo: str,
     run: Json,
     default_branch: str,
@@ -547,12 +547,12 @@ def _backfill_artifact(
     variant: str,
     changed_files: Callable[[], tuple[list[str], bool]],
 ) -> tuple[Outcome, str]:
-    # Ask sieve first, so re-runs skip ingested variants without downloading anything.
-    stored = sieve.lookup(repo, str(run["id"]), _attempt(run), variant)
+    # Ask siftwise first, so re-runs skip ingested variants without downloading anything.
+    stored = siftwise.lookup(repo, str(run["id"]), _attempt(run), variant)
     if stored is not None:
         if stored.get("commit_sha") != run["head_sha"]:
             return Outcome.ERROR, (
-                f"sieve has this run for commit {stored.get('commit_sha')}, "
+                f"siftwise has this run for commit {stored.get('commit_sha')}, "
                 f"GitHub says {run['head_sha']}"
             )
         return Outcome.SKIPPED, "already ingested"
@@ -570,12 +570,12 @@ def _backfill_artifact(
 
     changed, known = changed_files()
     metadata = {**run_metadata(repo, run, default_branch, changed, known), "variant": variant}
-    response = sieve.upload(files, metadata)
+    response = siftwise.upload(files, metadata)
     if response.status_code == httpx.codes.CREATED:
         return Outcome.NEW, f"{_result_total(response)} results from {len(files)} file(s)"
     if response.status_code == httpx.codes.OK:  # ingested concurrently since the lookup
         return Outcome.SKIPPED, "already ingested"
-    return Outcome.ERROR, f"sieve returned {response.status_code}: {response.text[:300]}"
+    return Outcome.ERROR, f"siftwise returned {response.status_code}: {response.text[:300]}"
 
 
 def _result_total(response: httpx.Response) -> str:
@@ -587,7 +587,7 @@ def _result_total(response: httpx.Response) -> str:
 
 def backfill(
     github: GitHubClient,
-    sieve: SieveClient,
+    siftwise: SiftwiseClient,
     repo: str,
     *,
     workflow: str | None = None,
@@ -600,7 +600,7 @@ def backfill(
     summary = Summary()
     for run in github.iter_completed_runs(repo, workflow, max_runs):
         try:
-            results = backfill_run(github, sieve, repo, run, default_branch, pattern)
+            results = backfill_run(github, siftwise, repo, run, default_branch, pattern)
         except (httpx.HTTPError, zipfile.BadZipFile, BackfillError) as exc:
             results = [(None, Outcome.ERROR, f"{type(exc).__name__}: {exc}")]
         label = (
@@ -610,10 +610,10 @@ def backfill(
         for variant, outcome, detail in results:
             summary.add(outcome)
             echo(f"{label}{f' [{variant}]' if variant else ''}: {outcome.value} ({detail})")
-    if sieve.defer_rollup:
+    if siftwise.defer_rollup:
         # Stats were left stale by every batch upload; bring them up to date once.
         try:
-            result = sieve.rollup(repo)
+            result = siftwise.rollup(repo)
         except httpx.HTTPError as exc:
             summary.rollup_error = f"{type(exc).__name__}: {exc}"
             echo(f"rollup failed: {summary.rollup_error}")
@@ -642,7 +642,7 @@ def main(
     max_runs: Annotated[
         int, typer.Option(min=1, help="Most recent completed runs to process.")
     ] = 200,
-    server: Annotated[str, typer.Option(help="sieve server URL.")] = "http://localhost:8000",
+    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
     batch: Annotated[
         bool,
         typer.Option(
@@ -652,13 +652,16 @@ def main(
         ),
     ] = False,
 ) -> None:
-    """Backfill sieve from past GitHub Actions runs. Tokens: GITHUB_TOKEN, SIEVE_API_TOKEN."""
+    """Backfill siftwise from past GitHub Actions runs. Tokens: GITHUB_TOKEN, SIFTWISE_API_TOKEN."""
     github_token = os.environ.get("GITHUB_TOKEN")
-    sieve_token = os.environ.get("SIEVE_API_TOKEN")
-    if not github_token or not sieve_token:
+    siftwise_token = os.environ.get("SIFTWISE_API_TOKEN")
+    if not github_token or not siftwise_token:
         missing = [
             name
-            for name, value in (("GITHUB_TOKEN", github_token), ("SIEVE_API_TOKEN", sieve_token))
+            for name, value in (
+                ("GITHUB_TOKEN", github_token),
+                ("SIFTWISE_API_TOKEN", siftwise_token),
+            )
             if not value
         ]
         typer.echo(f"error: set {' and '.join(missing)}", err=True)
@@ -669,12 +672,12 @@ def main(
 
     with (
         GitHubClient(github_token) as github,
-        SieveClient(server, sieve_token, defer_rollup=batch) as sieve,
+        SiftwiseClient(server, siftwise_token, defer_rollup=batch) as siftwise,
     ):
         try:
             summary = backfill(
                 github,
-                sieve,
+                siftwise,
                 repo,
                 workflow=workflow,
                 pattern=artifact_pattern,

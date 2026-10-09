@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from sieve.core.junit import (
+from siftwise.core.junit import (
     JUnitParseError,
     ParsedTestResult,
     Status,

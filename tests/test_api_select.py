@@ -7,12 +7,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from sieve.api.main import create_app
-from sieve.config import Settings
-from sieve.core.ingest import create_run
-from sieve.core.junit import ParsedTestResult, Status
-from sieve.core.schemas import RunMetadata
-from sieve.db import get_session
+from siftwise.api.main import create_app
+from siftwise.config import Settings
+from siftwise.core.ingest import create_run
+from siftwise.core.junit import ParsedTestResult, Status
+from siftwise.core.schemas import RunMetadata
+from siftwise.db import get_session
 
 TOKEN = "test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}

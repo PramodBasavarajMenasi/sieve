@@ -81,7 +81,7 @@ def upgrade() -> None:
         sa.Column("status", sa.String(length=16), nullable=False),
         sa.Column("duration_ms", sa.Integer(), nullable=True),
         sa.Column("attempt", sa.Integer(), server_default="1", nullable=False),
-        # Truncated to 4 KB by the ORM column type (sieve.core.models.TruncatedText).
+        # Truncated to 4 KB by the ORM column type (siftwise.core.models.TruncatedText).
         sa.Column("message", sa.Text(), nullable=True),
         sa.CheckConstraint(
             "status IN ('passed', 'failed', 'skipped', 'error')",

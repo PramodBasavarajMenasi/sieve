@@ -1,4 +1,4 @@
-"""Settings loaded from environment variables (prefix ``SIEVE_``)."""
+"""Settings loaded from environment variables (prefix ``SIFTWISE_``)."""
 
 from functools import lru_cache
 
@@ -7,9 +7,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="SIEVE_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="SIFTWISE_", env_file=".env", extra="ignore")
 
-    database_url: str = "postgresql+psycopg://sieve:sieve@localhost:5432/sieve"
+    database_url: str = "postgresql+psycopg://siftwise:siftwise@localhost:5432/siftwise"
     api_token: str | None = None
     max_upload_bytes: int = 50 * 1024 * 1024
     # test_stats are computed over this many days up to a repo's newest run (0 = all history).

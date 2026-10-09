@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from sieve.cli.pygraph import PyGraph, build_py_graph, conftests_for, module_of_test
+from siftwise.cli.pygraph import PyGraph, build_py_graph, conftests_for, module_of_test
 
 TREE = {
     "pkg/__init__.py": "from .core import thing\n",

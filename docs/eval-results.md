@@ -1,6 +1,6 @@
 # Selector evaluation
 
-Replays of sieve's test selector against real CI history, to find out how much test time
+Replays of siftwise's test selector against real CI history, to find out how much test time
 selection saves and whether it would have missed real failures:
 
 - [ipfs/kubo](#ipfskubo): a Go project with about 4,100 known tests.
@@ -111,10 +111,10 @@ The `-run` change had no effect on this sample, because no failing run went sele
 Three changes went into this round:
 - **PR lookup fallback:** backfill finds a run's PR from the repo's PR list by head branch,
   including closed PRs. Unknown PR diffs went from 18 to 0.
-- **Import graph:** `sieve select` runs `go list` and sends `affected_packages`. Every package
+- **Import graph:** `siftwise select` runs `go list` and sends `affected_packages`. Every package
   whose test build imports a changed package is selected and run whole.
-- **Declared dependencies:** `.sieve.toml` `[[depends]]`. kubo's rule
-  ([scripts/eval/kubo.sieve.toml](../scripts/eval/kubo.sieve.toml)) makes `test/cli` depend on
+- **Declared dependencies:** `.siftwise.toml` `[[depends]]`. kubo's rule
+  ([scripts/eval/kubo.siftwise.toml](../scripts/eval/kubo.siftwise.toml)) makes `test/cli` depend on
   every non-test `.go` file.
 
 #### PR mode
@@ -125,7 +125,7 @@ Three changes went into this round:
 | Failing PR runs with a known diff | 3 runs, 11 failures, all caught | 5 runs, 19 failures, all caught |
 | **Caught without fallbacks** | **1 of 2** | **9 of 10** |
 
-| Run | What changed | Failed tests | Without fallbacks (import graph + `.sieve.toml`) |
+| Run | What changed | Failed tests | Without fallbacks (import graph + `.siftwise.toml`) |
 |---|---|---|---|
 | a41db4a | `go.mod`, `go.sum` | 9 routing tests | nothing maps; only the fallback protects it |
 | 6badb4a | 11 files incl. `config/import.go`, `core/commands/dag/import.go`, `go.mod` | 4 × `TestCidCommands…` | 4,020 tests, **catches 4 / 4** (go imports) |
@@ -141,7 +141,7 @@ alone (round 1) to **9 of 10** (round 3).
 - **The import graph caught the `TestCidCommands` failures.** In round 1 they were the main
   example of the dependents gap. `test/cli`'s test build imports 61 kubo packages through its
   harness, so a change to `core/commands/dag` or the plugin loader reaches it through imports.
-- **The declared rule added almost nothing for kubo.** With and without `kubo.sieve.toml`, PR mode
+- **The declared rule added almost nothing for kubo.** With and without `kubo.siftwise.toml`, PR mode
   caught the same failures: 9 of 10. The rule only made selections slightly larger: 4,020 vs
   4,018 tests on 6badb4a, and 3,385 vs 3,237 on ef7060f. In the main replay it applied to one
   run (ceafeba): 1,865 → 2,013 tests and 19% → 14% of time skipped. That moved the overall
@@ -190,7 +190,7 @@ Every counterfactual miss across the rounds, and the signal that catches it:
 3. **Binary-level suites dominate.** `test/cli` is about 85% of kubo's test time and is reachable
    from most packages. Realistic savings on kubo come from docs, version-only and narrow unit
    changes.
-4. **Backfill diffs must match what `sieve select` sends.** With head-vs-first-parent diffs, PRs
+4. **Backfill diffs must match what `siftwise select` sends.** With head-vs-first-parent diffs, PRs
    looked smaller than they were. That inflated the savings (99.6%) and created false misses
    (`ondemandpin`).
 5. **Co-change only helps after a first miss.** It caught `TestBackupBootstrapPeers` on the
@@ -203,13 +203,13 @@ Every counterfactual miss across the rounds, and the signal that catches it:
 
 ### Reproducing
 
-This needs a kubo clone, Go, a sieve server with kubo backfilled, and `GITHUB_TOKEN` (for
+This needs a kubo clone, Go, a siftwise server with kubo backfilled, and `GITHUB_TOKEN` (for
 `--replay-main`).
 
 ```sh
-uv run python scripts/eval_kubo.py --failing --sieve-toml scripts/eval/kubo.sieve.toml \
+uv run python scripts/eval_kubo.py --failing --siftwise-toml scripts/eval/kubo.siftwise.toml \
     --kubo-checkout ../kubo --go go
-uv run python scripts/eval_kubo.py --replay-main --sieve-toml scripts/eval/kubo.sieve.toml \
+uv run python scripts/eval_kubo.py --replay-main --siftwise-toml scripts/eval/kubo.siftwise.toml \
     --kubo-checkout ../kubo --go go
 ```
 
@@ -240,12 +240,12 @@ GitHub compares and import graphs are cached in `.eval-cache/`.
 - Same method as for kubo, with two differences:
   - **Python import graph.** In round 1, selection used path mapping, co-change and recently
     failed, and a static import graph at each commit only explained misses. In round 2 the
-    graph is computed at each target commit and passed to the selector, as `sieve select`
+    graph is computed at each target commit and passed to the selector, as `siftwise select`
     does.
   - **History is loaded once.** The eval reads the repo's raw results into memory once (about
     100 s) and rebuilds each target's history from that. PR mode took 7.7 minutes for 49
     targets, and the main replay 2.3 minutes.
-- No `.sieve.toml` (no declared dependencies or always-run patterns).
+- No `.siftwise.toml` (no declared dependencies or always-run patterns).
 
 ### Fixes made before these numbers
 
@@ -346,8 +346,8 @@ Items 1–3 are addressed in round 2.
 
 **Changes**
 
-- **Python import graph.** `sieve select` builds a static import graph of the checkout with
-  `ast` (`sieve.cli.pygraph`), like `go list` for Go. It includes parent packages'
+- **Python import graph.** `siftwise select` builds a static import graph of the checkout with
+  `ast` (`siftwise.cli.pygraph`), like `go list` for Go. It includes parent packages'
   `__init__.py` and the `conftest.py` files pytest loads. It sends every test file that imports
   a changed module, directly or transitively, as `affected_files`. The selector runs those
   files whole, with the reason `imports changed module X`, and a changed module imported by a
@@ -423,7 +423,7 @@ run didn't change, in runs that went full anyway.
 
 ### Reproducing
 
-This needs an rdflib clone, a sieve server with rdflib backfilled and rolled up (`POST
+This needs an rdflib clone, a siftwise server with rdflib backfilled and rolled up (`POST
 /repos/RDFLib/rdflib/rollup`), and `GITHUB_TOKEN` for `--replay-main`.
 
 ```sh

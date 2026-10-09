@@ -13,10 +13,10 @@ import respx
 from typer.testing import CliRunner
 
 from scripts import backfill as bf
-from scripts.backfill import BackfillError, GitHubClient, SieveClient, Summary
+from scripts.backfill import BackfillError, GitHubClient, SiftwiseClient, Summary
 
 GH = "https://api.github.com"
-SIEVE = "http://sieve.test"
+SIFTWISE = "http://siftwise.test"
 REPO = "acme/shop"
 HEAD = "a" * 40
 PARENT = "b" * 40
@@ -42,7 +42,7 @@ class FakeClock:
         self.now += seconds
 
 
-# --- GitHub/sieve fakes -------------------------------------------------------------------
+# --- GitHub/siftwise fakes -------------------------------------------------------------------
 
 
 def make_zip(files: dict[str, bytes]) -> bytes:
@@ -110,11 +110,11 @@ def pr(base: str, head: str = HEAD, number: int = 7) -> dict[str, Any]:
     return {"number": number, "head": {"sha": head}, "base": {"sha": base}}
 
 
-def mock_sieve(router: respx.MockRouter, *statuses: int) -> respx.Route:
+def mock_siftwise(router: respx.MockRouter, *statuses: int) -> respx.Route:
     responses = [
         httpx.Response(status, json={"run_id": 1, "counts": {"total": 12}}) for status in statuses
     ]
-    return router.post(f"{SIEVE}/runs").mock(side_effect=responses)
+    return router.post(f"{SIFTWISE}/runs").mock(side_effect=responses)
 
 
 def standard_run(router: respx.MockRouter, run: dict[str, Any]) -> None:
@@ -127,8 +127,8 @@ def standard_run(router: respx.MockRouter, run: dict[str, Any]) -> None:
 def router() -> Iterator[respx.MockRouter]:
     with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
         mock.get(f"{GH}/repos/{REPO}").respond(json={"default_branch": "main"})
-        # By default sieve has none of the runs; tests override router["lookup"].
-        mock.get(f"{SIEVE}/runs/lookup", name="lookup").respond(404)
+        # By default siftwise has none of the runs; tests override router["lookup"].
+        mock.get(f"{SIFTWISE}/runs/lookup", name="lookup").respond(404)
         yield mock
 
 
@@ -141,9 +141,11 @@ def run_backfill(clock: FakeClock, **kwargs: Any) -> tuple[Summary, list[str]]:
     lines: list[str] = []
     with (
         GitHubClient("gh-token", sleep=clock.sleep, clock=clock.time, **kwargs.pop("gh", {})) as gh,
-        SieveClient(SIEVE, "sieve-token", defer_rollup=kwargs.pop("batch", False)) as sieve,
+        SiftwiseClient(
+            SIFTWISE, "siftwise-token", defer_rollup=kwargs.pop("batch", False)
+        ) as siftwise,
     ):
-        summary = bf.backfill(gh, sieve, REPO, echo=lines.append, **kwargs)
+        summary = bf.backfill(gh, siftwise, REPO, echo=lines.append, **kwargs)
     return summary, lines
 
 
@@ -184,7 +186,7 @@ def test_normal_run_is_uploaded(router: respx.MockRouter, clock: FakeClock) -> N
         router,
         [{"filename": "src/a.py"}, {"filename": "src/new.py", "previous_filename": "src/old.py"}],
     )
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     summary, lines = run_backfill(clock)
 
@@ -193,8 +195,8 @@ def test_normal_run_is_uploaded(router: respx.MockRouter, clock: FakeClock) -> N
     assert "run 101 #2 aaaaaaa main [results]: new (12 results from 2 file(s))" in lines
     assert not coverage.called  # non-matching artifacts are never downloaded
 
-    request = sieve.calls.last.request
-    assert request.headers["authorization"] == "Bearer sieve-token"
+    request = siftwise.calls.last.request
+    assert request.headers["authorization"] == "Bearer siftwise-token"
     metadata, files = parse_upload(request)
     assert metadata == {
         "repo": REPO,
@@ -215,7 +217,7 @@ def test_normal_run_is_uploaded(router: respx.MockRouter, clock: FakeClock) -> N
         "run_attempt": "2",
         "variant": "results",
     }
-    assert lookup.headers["authorization"] == "Bearer sieve-token"
+    assert lookup.headers["authorization"] == "Bearer siftwise-token"
     assert files == [
         ("junit-results/pytest.xml", PYTEST_XML),
         ("junit-results/nested/go.xml", GO_XML),
@@ -238,29 +240,29 @@ def test_branch_and_pull_request_runs_are_not_main(
         standard_run(router, gh_run(run_id))
     mock_changed_files(router, [])
     mock_compare(router, BASE, [])
-    sieve = mock_sieve(router, 201, 201)
+    siftwise = mock_siftwise(router, 201, 201)
 
     run_backfill(clock)
 
-    assert [parse_upload(call.request)[0]["is_main"] for call in sieve.calls] == [False, False]
+    assert [parse_upload(call.request)[0]["is_main"] for call in siftwise.calls] == [False, False]
 
 
 def test_started_at_falls_back_to_created_at(router: respx.MockRouter, clock: FakeClock) -> None:
     mock_runs(router, gh_run(1, run_started_at=None))
     standard_run(router, gh_run(1))
     mock_changed_files(router, [])
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
-    assert parse_upload(sieve.calls.last.request)[0]["started_at"] == "2026-09-01T09:59:00Z"
+    assert parse_upload(siftwise.calls.last.request)[0]["started_at"] == "2026-09-01T09:59:00Z"
 
 
 # --- re-runs ------------------------------------------------------------------------------
 
 
 def lookup_finds(*run_ids: int, commit_sha: str = HEAD, variants: set[str] | None = None) -> Any:
-    """A /runs/lookup side effect: sieve has these runs (only these variants, if given)."""
+    """A /runs/lookup side effect: siftwise has these runs (only these variants, if given)."""
 
     def respond(request: httpx.Request) -> httpx.Response:
         run_id = int(request.url.params["ci_run_id"])
@@ -281,7 +283,7 @@ def test_already_ingested_run_is_skipped_without_downloading(
     download_1 = mock_download(router, 10, make_zip({"pytest.xml": PYTEST_XML}))
     standard_run(router, gh_run(2))
     commit = mock_changed_files(router, [])
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     summary, lines = run_backfill(clock)
 
@@ -289,7 +291,7 @@ def test_already_ingested_run_is_skipped_without_downloading(
     assert str(summary) == "1 new, 1 skipped, 0 no artifacts, 0 expired, 0 errors"
     assert lines[0].startswith("run 1 ") and lines[0].endswith("skipped (already ingested)")
     assert not download_1.called  # listed (to learn the variants), never downloaded
-    assert sieve.call_count == 1 and commit.call_count == 1  # only run 2
+    assert siftwise.call_count == 1 and commit.call_count == 1  # only run 2
 
 
 def test_rerun_of_full_backfill_downloads_nothing(
@@ -318,7 +320,7 @@ def test_run_ingested_concurrently_after_lookup_is_skipped(
     mock_runs(router, gh_run(1))
     standard_run(router, gh_run(1))
     mock_changed_files(router, [])
-    mock_sieve(router, 200)  # lookup said 404, but another uploader won the race
+    mock_siftwise(router, 200)  # lookup said 404, but another uploader won the race
 
     summary, _ = run_backfill(clock)
 
@@ -360,13 +362,13 @@ def test_missing_artifact(router: respx.MockRouter, clock: FakeClock) -> None:
     mock_artifacts(router, 1, artifact(10, "coverage-report"))
     mock_artifacts(router, 2)  # no artifacts at all
     compare = mock_changed_files(router, [])
-    sieve = mock_sieve(router)
+    siftwise = mock_siftwise(router)
 
     summary, lines = run_backfill(clock)
 
     assert counts(summary) == {"no artifacts": 2}
     assert "no artifact matches '*junit*'" in lines[0]
-    assert not sieve.called
+    assert not siftwise.called
     assert not compare.called  # no GitHub calls wasted on runs with nothing to upload
 
 
@@ -376,12 +378,12 @@ def test_artifact_without_xml_counts_as_no_artifacts(
     mock_runs(router, gh_run(1))
     mock_artifacts(router, 1, artifact(10, "JUnit-Reports"))  # pattern is case-insensitive
     mock_download(router, 10, make_zip({"report.html": b"<html/>"}))
-    sieve = mock_sieve(router)
+    siftwise = mock_siftwise(router)
 
     summary, _ = run_backfill(clock)
 
     assert counts(summary) == {"no artifacts": 1}
-    assert not sieve.called
+    assert not siftwise.called
 
 
 def test_custom_artifact_pattern(router: respx.MockRouter, clock: FakeClock) -> None:
@@ -389,7 +391,7 @@ def test_custom_artifact_pattern(router: respx.MockRouter, clock: FakeClock) -> 
     mock_artifacts(router, 1, artifact(10, "test-results-linux"))
     mock_download(router, 10, make_zip({"r.xml": GO_XML}))
     mock_changed_files(router, [])
-    mock_sieve(router, 201)
+    mock_siftwise(router, 201)
 
     summary, _ = run_backfill(clock, pattern="test-results-*")
 
@@ -400,14 +402,14 @@ def test_expired_artifact_is_not_downloaded(router: respx.MockRouter, clock: Fak
     mock_runs(router, gh_run(1))
     mock_artifacts(router, 1, artifact(10, "junit", expired=True))
     download = mock_download(router, 10, b"")
-    sieve = mock_sieve(router)
+    siftwise = mock_siftwise(router)
 
     summary, lines = run_backfill(clock)
 
     assert counts(summary) == {"expired": 1}
     assert "expired: junit" in lines[0]
     assert not download.called
-    assert not sieve.called
+    assert not siftwise.called
 
 
 def test_artifact_expiring_at_download_time(router: respx.MockRouter, clock: FakeClock) -> None:
@@ -427,14 +429,14 @@ def test_partially_expired_run_uploads_what_remains(
     mock_artifacts(router, 1, artifact(10, "junit-a", expired=True), artifact(11, "junit-b"))
     mock_download(router, 11, make_zip({"go.xml": GO_XML}))
     mock_changed_files(router, [])
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     summary, lines = run_backfill(clock)
 
     # Each artifact is its own variant: the expired one is reported, the other uploaded.
     assert counts(summary) == {"new": 1, "expired": 1}
     assert any("[a]: expired" in line for line in lines)
-    metadata, files = parse_upload(sieve.calls.last.request)
+    metadata, files = parse_upload(siftwise.calls.last.request)
     assert (metadata["variant"], [name for name, _ in files]) == ("b", ["junit-b/go.xml"])
 
 
@@ -456,12 +458,12 @@ def test_matrix_artifacts_are_uploaded_as_separate_variants(
     mock_download(router, 10, make_zip({"linux.xml": PYTEST_XML}))
     mock_download(router, 11, make_zip({"mac.xml": GO_XML}))
     compare = mock_changed_files(router, [{"filename": "src/a.py"}])
-    sieve = mock_sieve(router, 201, 201)
+    siftwise = mock_siftwise(router, 201, 201)
 
     summary, lines = run_backfill(clock, pattern=MATRIX)
 
     assert counts(summary) == {"new": 2}
-    uploads = [parse_upload(call.request) for call in sieve.calls]
+    uploads = [parse_upload(call.request) for call in siftwise.calls]
     assert [(meta["variant"], [name for name, _ in files]) for meta, files in uploads] == [
         ("3.12-ubuntu-latest", ["3.12-ubuntu-latest-pytest-junit-xml/linux.xml"]),
         ("3.12-macos-latest", ["3.12-macos-latest-pytest-junit-xml/mac.xml"]),
@@ -483,13 +485,13 @@ def test_rerun_uploads_only_the_missing_variant(router: respx.MockRouter, clock:
     mock_download(router, 11, make_zip({"mac.xml": GO_XML}))
     mock_changed_files(router, [])
     router["lookup"].mock(side_effect=lookup_finds(1, variants={"3.12-ubuntu-latest"}))
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     summary, _ = run_backfill(clock, pattern=MATRIX)
 
     assert counts(summary) == {"skipped": 1, "new": 1}
     assert not linux.called
-    assert parse_upload(sieve.calls.last.request)[0]["variant"] == "3.12-macos-latest"
+    assert parse_upload(siftwise.calls.last.request)[0]["variant"] == "3.12-macos-latest"
 
 
 @pytest.mark.parametrize(
@@ -519,8 +521,8 @@ def test_oversized_artifact_is_rejected_before_decompressing() -> None:
 # --- changed files ------------------------------------------------------------------------
 
 
-def uploaded_diff(sieve: respx.Route) -> tuple[list[str], bool]:
-    metadata = parse_upload(sieve.calls.last.request)[0]
+def uploaded_diff(siftwise: respx.Route) -> tuple[list[str], bool]:
+    metadata = parse_upload(siftwise.calls.last.request)[0]
     return metadata["changed_files"], metadata["changed_files_known"]
 
 
@@ -530,11 +532,11 @@ def test_push_run_diffs_the_whole_push(router: respx.MockRouter, clock: FakeCloc
     router.get(f"{GH}/repos/{REPO}/check-suites/55").respond(json={"before": BEFORE, "after": HEAD})
     mock_compare(router, BEFORE, [{"filename": "a.go"}, {"filename": "b.go"}])
     first_parent = router.get(f"{GH}/repos/{REPO}/commits/{HEAD}").respond(json={})
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
-    assert uploaded_diff(sieve) == (["a.go", "b.go"], True)
+    assert uploaded_diff(siftwise) == (["a.go", "b.go"], True)
     assert not first_parent.called
 
 
@@ -554,11 +556,11 @@ def test_push_run_falls_back_to_first_parent(
     standard_run(router, gh_run(1))
     router.get(f"{GH}/repos/{REPO}/check-suites/55").mock(return_value=suite_response)
     mock_changed_files(router, [{"filename": "head_commit_only.go"}])
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
-    assert uploaded_diff(sieve) == (["head_commit_only.go"], True)
+    assert uploaded_diff(siftwise) == (["head_commit_only.go"], True)
 
 
 def test_pull_request_run_diffs_the_whole_pr(router: respx.MockRouter, clock: FakeClock) -> None:
@@ -567,11 +569,11 @@ def test_pull_request_run_diffs_the_whole_pr(router: respx.MockRouter, clock: Fa
     mock_runs(router, gh_run(1, event="pull_request", pull_requests=[other, pr(BASE)]))
     standard_run(router, gh_run(1))
     mock_compare(router, BASE, [{"filename": "first_commit.go"}, {"filename": "last_commit.go"}])
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
-    assert uploaded_diff(sieve) == (["first_commit.go", "last_commit.go"], True)
+    assert uploaded_diff(siftwise) == (["first_commit.go", "last_commit.go"], True)
 
 
 def test_fork_pull_request_base_is_looked_up(router: respx.MockRouter, clock: FakeClock) -> None:
@@ -580,12 +582,12 @@ def test_fork_pull_request_base_is_looked_up(router: respx.MockRouter, clock: Fa
     standard_run(router, gh_run(1))
     pulls = router.get(f"{GH}/repos/{REPO}/commits/{HEAD}/pulls").respond(json=[pr(BASE)])
     mock_compare(router, BASE, [{"filename": "fork_change.go"}])
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
     assert pulls.called
-    assert uploaded_diff(sieve) == (["fork_change.go"], True)
+    assert uploaded_diff(siftwise) == (["fork_change.go"], True)
 
 
 @pytest.mark.parametrize(
@@ -599,12 +601,12 @@ def test_pull_request_without_a_base_is_unknown(
     mock_runs(router, gh_run(1, event="pull_request", pull_requests=[]))
     standard_run(router, gh_run(1))
     router.get(f"{GH}/repos/{REPO}/commits/{HEAD}/pulls").mock(return_value=pulls_response)
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     summary, _ = run_backfill(clock)
 
     assert counts(summary) == {"new": 1}  # still uploaded, just without a diff
-    assert uploaded_diff(sieve) == ([], False)
+    assert uploaded_diff(siftwise) == ([], False)
 
 
 def fork_pr_run(run_id: int = 1) -> dict[str, Any]:
@@ -631,13 +633,13 @@ def test_closed_pr_is_found_by_branch(router: respx.MockRouter, clock: FakeClock
         json=[closed_pr(BASE, HEAD, "2026-08-30T00:00:00Z", "2026-09-02T00:00:00Z", 7)]
     )
     mock_compare(router, BASE, [{"filename": "closed_pr.go"}])
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
     params = branch_prs.calls.last.request.url.params
     assert (params["state"], params["head"]) == ("all", "forker:master")
-    assert uploaded_diff(sieve) == (["closed_pr.go"], True)
+    assert uploaded_diff(siftwise) == (["closed_pr.go"], True)
 
 
 def test_branch_pr_is_matched_by_time_when_head_moved(
@@ -656,11 +658,11 @@ def test_branch_pr_is_matched_by_time_when_head_moved(
         ]
     )
     mock_compare(router, BASE, [{"filename": "pr8.go"}])
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
-    assert uploaded_diff(sieve) == (["pr8.go"], True)
+    assert uploaded_diff(siftwise) == (["pr8.go"], True)
 
 
 @pytest.mark.parametrize(
@@ -680,11 +682,11 @@ def test_branch_lookup_without_a_clear_match_is_unknown(
     standard_run(router, gh_run(1))
     router.get(f"{GH}/repos/{REPO}/commits/{HEAD}/pulls").respond(json=[])
     router.get(f"{GH}/repos/{REPO}/pulls").mock(return_value=branch_response)
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock, gh={"max_retries": 0})
 
-    assert uploaded_diff(sieve) == ([], False)
+    assert uploaded_diff(siftwise) == ([], False)
 
 
 @pytest.mark.parametrize("event", ["schedule", "workflow_dispatch", "pull_request_target"])
@@ -693,11 +695,11 @@ def test_other_events_have_unknown_diffs(
 ) -> None:
     mock_runs(router, gh_run(1, event=event))
     standard_run(router, gh_run(1))
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
-    assert uploaded_diff(sieve) == ([], False)
+    assert uploaded_diff(siftwise) == ([], False)
     compared = [c for c in router.calls if "/compare/" in c.request.url.path]
     assert compared == []
 
@@ -717,12 +719,12 @@ def test_unknown_changed_files_are_flagged(
     standard_run(router, gh_run(1))
     router.get(f"{GH}/repos/{REPO}/commits/{HEAD}").respond(json={"parents": [{"sha": PARENT}]})
     router.get(f"{GH}/repos/{REPO}/compare/{PARENT}...{HEAD}").mock(return_value=compare_response)
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     summary, _ = run_backfill(clock)
 
     assert counts(summary) == {"new": 1}  # the run is still uploaded
-    metadata = parse_upload(sieve.calls.last.request)[0]
+    metadata = parse_upload(siftwise.calls.last.request)[0]
     assert (metadata["changed_files"], metadata["changed_files_known"]) == ([], False)
 
 
@@ -731,11 +733,11 @@ def test_root_commit_changed_files_are_unknown(router: respx.MockRouter, clock: 
     mock_runs(router, gh_run(1))
     standard_run(router, gh_run(1))
     router.get(f"{GH}/repos/{REPO}/commits/{HEAD}").respond(json={"parents": []})
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
-    metadata = parse_upload(sieve.calls.last.request)[0]
+    metadata = parse_upload(siftwise.calls.last.request)[0]
     assert (metadata["changed_files"], metadata["changed_files_known"]) == ([], False)
 
 
@@ -744,11 +746,11 @@ def test_empty_diff_is_known(router: respx.MockRouter, clock: FakeClock) -> None
     mock_runs(router, gh_run(1))
     standard_run(router, gh_run(1))
     mock_changed_files(router, [])
-    sieve = mock_sieve(router, 201)
+    siftwise = mock_siftwise(router, 201)
 
     run_backfill(clock)
 
-    metadata = parse_upload(sieve.calls.last.request)[0]
+    metadata = parse_upload(siftwise.calls.last.request)[0]
     assert (metadata["changed_files"], metadata["changed_files_known"]) == ([], True)
 
 
@@ -771,7 +773,7 @@ def test_rate_limit_waits_for_reset_then_retries(
     )
     standard_run(router, gh_run(1))
     mock_changed_files(router, [])
-    mock_sieve(router, 201)
+    mock_siftwise(router, 201)
 
     summary, _ = run_backfill(clock)
 
@@ -872,12 +874,12 @@ def test_per_run_errors_are_counted_and_backfill_continues(
     mock_download(router, 20, b"this is not a zip")
     standard_run(router, gh_run(3))
     mock_changed_files(router, [])
-    mock_sieve(router, 409, 201)
+    mock_siftwise(router, 409, 201)
 
     summary, lines = run_backfill(clock)
 
     assert counts(summary) == {"errors": 2, "new": 1}
-    assert "sieve returned 409" in lines[0]
+    assert "siftwise returned 409" in lines[0]
     assert "BadZipFile" in lines[1]
 
 
@@ -927,15 +929,15 @@ def test_batch_mode_defers_rollup_and_runs_it_once(
     standard_run(router, gh_run(1))
     standard_run(router, gh_run(2))
     mock_changed_files(router, [])
-    sieve = mock_sieve(router, 201, 201)
-    rollup = router.post(f"{SIEVE}/repos/{REPO}/rollup").respond(
+    siftwise = mock_siftwise(router, 201, 201)
+    rollup = router.post(f"{SIFTWISE}/repos/{REPO}/rollup").respond(
         json={"repo": REPO, "tests_updated": 7, "window_days": 90, "seconds": 1.5}
     )
 
     summary, lines = run_backfill(clock, batch=True)
 
     assert counts(summary) == {"new": 2}
-    assert [call.request.url.params.get("defer_rollup") for call in sieve.calls] == [
+    assert [call.request.url.params.get("defer_rollup") for call in siftwise.calls] == [
         "true",
         "true",
     ]
@@ -948,18 +950,18 @@ def test_normal_mode_does_not_defer_or_roll_up(router: respx.MockRouter, clock: 
     mock_runs(router, gh_run(1))
     standard_run(router, gh_run(1))
     mock_changed_files(router, [])
-    sieve = mock_sieve(router, 201)
-    rollup = router.post(f"{SIEVE}/repos/{REPO}/rollup").respond(json={})
+    siftwise = mock_siftwise(router, 201)
+    rollup = router.post(f"{SIFTWISE}/repos/{REPO}/rollup").respond(json={})
 
     run_backfill(clock)
 
-    assert "defer_rollup" not in sieve.calls.last.request.url.params
+    assert "defer_rollup" not in siftwise.calls.last.request.url.params
     assert not rollup.called
 
 
 def test_batch_rollup_failure_is_reported(router: respx.MockRouter, clock: FakeClock) -> None:
     mock_runs(router)
-    router.post(f"{SIEVE}/repos/{REPO}/rollup").respond(500)
+    router.post(f"{SIFTWISE}/repos/{REPO}/rollup").respond(500)
 
     summary, lines = run_backfill(clock, batch=True)
 
@@ -971,28 +973,28 @@ def test_cli_batch_rollup_failure_exits_1(
     router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
-    monkeypatch.setenv("SIEVE_API_TOKEN", "sieve-token")
+    monkeypatch.setenv("SIFTWISE_API_TOKEN", "siftwise-token")
     mock_runs(router)
-    router.post(f"{SIEVE}/repos/{REPO}/rollup").respond(503)
+    router.post(f"{SIFTWISE}/repos/{REPO}/rollup").respond(503)
 
-    result = CliRunner().invoke(bf.app, ["--repo", REPO, "--server", SIEVE, "--batch"])
+    result = CliRunner().invoke(bf.app, ["--repo", REPO, "--server", SIFTWISE, "--batch"])
 
     assert result.exit_code == 1
-    assert f"POST {SIEVE}/repos/{REPO}/rollup" in result.stderr
+    assert f"POST {SIFTWISE}/repos/{REPO}/rollup" in result.stderr
 
 
 def test_cli_prints_summary_and_exit_code(
     router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
-    monkeypatch.setenv("SIEVE_API_TOKEN", "sieve-token")
+    monkeypatch.setenv("SIFTWISE_API_TOKEN", "siftwise-token")
     mock_runs(router, gh_run(1), gh_run(2))
     standard_run(router, gh_run(1))
     standard_run(router, gh_run(2))
     mock_changed_files(router, [])
-    mock_sieve(router, 201, 500)
+    mock_siftwise(router, 201, 500)
 
-    result = CliRunner().invoke(bf.app, ["--repo", REPO, "--server", SIEVE])
+    result = CliRunner().invoke(bf.app, ["--repo", REPO, "--server", SIFTWISE])
 
     assert "summary: 1 new, 0 skipped, 0 no artifacts, 0 expired, 1 errors" in result.stdout
     assert result.exit_code == 1  # any per-run error fails the command
@@ -1001,17 +1003,17 @@ def test_cli_prints_summary_and_exit_code(
 @pytest.mark.parametrize(
     ("env", "args", "message"),
     [
-        ({}, ["--repo", REPO], "set GITHUB_TOKEN and SIEVE_API_TOKEN"),
-        ({"GITHUB_TOKEN": "x"}, ["--repo", REPO], "set SIEVE_API_TOKEN"),
-        ({"GITHUB_TOKEN": "x", "SIEVE_API_TOKEN": "y"}, ["--repo", "shop"], "owner/name"),
+        ({}, ["--repo", REPO], "set GITHUB_TOKEN and SIFTWISE_API_TOKEN"),
+        ({"GITHUB_TOKEN": "x"}, ["--repo", REPO], "set SIFTWISE_API_TOKEN"),
+        ({"GITHUB_TOKEN": "x", "SIFTWISE_API_TOKEN": "y"}, ["--repo", "shop"], "owner/name"),
     ],
-    ids=["no-tokens", "no-sieve-token", "bad-repo"],
+    ids=["no-tokens", "no-siftwise-token", "bad-repo"],
 )
 def test_cli_rejects_bad_configuration(
     monkeypatch: pytest.MonkeyPatch, env: dict[str, str], args: list[str], message: str
 ) -> None:
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("SIEVE_API_TOKEN", raising=False)
+    monkeypatch.delenv("SIFTWISE_API_TOKEN", raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
 
@@ -1025,7 +1027,7 @@ def test_cli_reports_fatal_github_errors(
     router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "bad")
-    monkeypatch.setenv("SIEVE_API_TOKEN", "y")
+    monkeypatch.setenv("SIFTWISE_API_TOKEN", "y")
     router.get(f"{GH}/repos/{REPO}").respond(401, json={"message": "Bad credentials"})
 
     result = CliRunner().invoke(bf.app, ["--repo", REPO])

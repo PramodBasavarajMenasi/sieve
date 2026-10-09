@@ -1,4 +1,4 @@
-"""Find public repos that could serve as sieve eval repos (first pass, broad and cheap).
+"""Find public repos that could serve as siftwise eval repos (first pass, broad and cheap).
 
 Code-searches workflows that upload JUnit XML, then keeps repos that are active, written in
 ``--language``, have live JUnit artifacts, enough human PRs and enough tests. For each it

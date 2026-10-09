@@ -5,9 +5,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from sieve.core.history import get_recent_results, get_test_stats
-from sieve.core.schemas import TestHistoryResponse, TestResultOut, TestStatsOut
-from sieve.db import get_session
+from siftwise.core.history import get_recent_results, get_test_stats
+from siftwise.core.schemas import TestHistoryResponse, TestResultOut, TestStatsOut
+from siftwise.db import get_session
 
 router = APIRouter()
 

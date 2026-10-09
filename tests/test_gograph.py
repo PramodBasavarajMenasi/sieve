@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sieve.cli.gograph import GoGraph, build_graph, parse_go_list, run_go_list
+from siftwise.cli.gograph import GoGraph, build_graph, parse_go_list, run_go_list
 from tests.gofixture import M, go_list_output, go_list_packages
 
 A, B, C, D = (f"{M}/{x}" for x in "abcd")
@@ -74,7 +74,7 @@ def test_run_go_list_returns_none_on_failure(
     def timeout(*args: object, **kwargs: object) -> None:
         raise subprocess.TimeoutExpired("go", 1)
 
-    monkeypatch.setattr("sieve.cli.gograph.subprocess.run", timeout)
+    monkeypatch.setattr("siftwise.cli.gograph.subprocess.run", timeout)
     assert run_go_list(tmp_path) is None
 
 
@@ -85,7 +85,7 @@ def test_run_go_list_parses_output(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         calls.append(args)
         return subprocess.CompletedProcess(args, 0, go_list_output(tmp_path).encode(), b"")
 
-    monkeypatch.setattr("sieve.cli.gograph.subprocess.run", fake_run)
+    monkeypatch.setattr("siftwise.cli.gograph.subprocess.run", fake_run)
     packages = run_go_list(tmp_path)
 
     assert calls == [["go", "list", "-deps", "-test", "-json", "./..."]]
@@ -94,7 +94,7 @@ def test_run_go_list_parses_output(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 def test_run_go_list_rejects_garbage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "sieve.cli.gograph.subprocess.run",
+        "siftwise.cli.gograph.subprocess.run",
         lambda args, **kw: subprocess.CompletedProcess(args, 0, b"{not json", b""),
     )
     assert run_go_list(tmp_path) is None

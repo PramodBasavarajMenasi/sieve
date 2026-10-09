@@ -6,11 +6,11 @@ import pytest
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
-from sieve.core.history import recompute_repo_stats
-from sieve.core.ingest import create_run
-from sieve.core.junit import ParsedTestResult, Status
-from sieve.core.schemas import RunMetadata
-from sieve.core.selector import (
+from siftwise.core.history import recompute_repo_stats
+from siftwise.core.ingest import create_run
+from siftwise.core.junit import ParsedTestResult, Status
+from siftwise.core.schemas import RunMetadata
+from siftwise.core.selector import (
     DependsRule,
     FailedRun,
     KnownTest,
@@ -323,7 +323,7 @@ def test_dependents_only_cover_the_packages_they_import() -> None:
     assert selection.reason == "changed file maps to no known tests: plugin/loader.go"
 
 
-# --- declared dependencies (.sieve.toml) --------------------------------------------------
+# --- declared dependencies (.siftwise.toml) --------------------------------------------------
 
 CLI_ON_GO = DependsRule("test/cli/**", ("**/*.go", "!**/*_test.go"))
 

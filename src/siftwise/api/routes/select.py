@@ -5,9 +5,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from sieve.core.schemas import SelectedTestOut, SelectRequest, SelectResponse
-from sieve.core.selector import DependsRule, SelectorConfig, load_history, select_tests
-from sieve.db import get_session
+from siftwise.core.schemas import SelectedTestOut, SelectRequest, SelectResponse
+from siftwise.core.selector import DependsRule, SelectorConfig, load_history, select_tests
+from siftwise.db import get_session
 
 router = APIRouter()
 

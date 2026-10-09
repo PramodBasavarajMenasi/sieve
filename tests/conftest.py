@@ -20,9 +20,9 @@ def alembic_config(url: str) -> Config:
 
 @pytest.fixture(scope="session")
 def db_url() -> str:
-    url = os.environ.get("SIEVE_TEST_DATABASE_URL")
+    url = os.environ.get("SIFTWISE_TEST_DATABASE_URL")
     if not url:
-        pytest.skip("SIEVE_TEST_DATABASE_URL not set")
+        pytest.skip("SIFTWISE_TEST_DATABASE_URL not set")
     return url
 
 

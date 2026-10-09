@@ -15,9 +15,9 @@ counts. For each target R:
    selection; broken-on-main is recomputed per variant from raw results. The repo's raw
    results are read once into memory (``HistoryIndex``), so each target is cheap.
 2. With ``--checkout``, compute the import graph at R's commit (cached per commit) and pass it
-   to the selector, as ``sieve select`` does: for Go ``go list -deps -test -json ./...``
-   (needs ``--go``), for Python the static graph from ``sieve.cli.pygraph``.
-3. Run ``select_tests`` with the repo config from ``--sieve-toml``.
+   to the selector, as ``siftwise select`` does: for Go ``go list -deps -test -json ./...``
+   (needs ``--go``), for Python the static graph from ``siftwise.cli.pygraph``.
+3. Run ``select_tests`` with the repo config from ``--siftwise-toml``.
 4. Compare with the tests that actually failed in R. A failure is caught if the selection's
    commands would run it (including new tests in a Python file or Go package run whole).
 5. Explain each miss with the signal that would have caught it.
@@ -27,9 +27,9 @@ counts. For each target R:
     uv run python -m scripts.eval.run_eval --repo RDFLib/rdflib --checkout ../rdflib
     uv run python -m scripts.eval.run_eval --repo RDFLib/rdflib --replay-main --checkout ../rdflib
     uv run python -m scripts.eval.run_eval --repo ipfs/kubo --failing \
-        --sieve-toml scripts/eval/kubo.sieve.toml --checkout ../kubo --go go
+        --siftwise-toml scripts/eval/kubo.siftwise.toml --checkout ../kubo --go go
 
-Reads SIEVE_DATABASE_URL (or .env), and GITHUB_TOKEN for --replay-main. Read-only.
+Reads SIFTWISE_DATABASE_URL (or .env), and GITHUB_TOKEN for --replay-main. Read-only.
 """
 
 from __future__ import annotations
@@ -57,10 +57,10 @@ from sqlalchemy.orm import Session
 if not __package__:  # run as a file path: make the repo root importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from sieve.cli.gograph import GoGraph, build_graph, parse_go_list
-from sieve.cli.pygraph import PyGraph, build_py_graph, module_of_test
-from sieve.cli.repoconfig import load_repo_config, read_go_module
-from sieve.core.selector import (
+from siftwise.cli.gograph import GoGraph, build_graph, parse_go_list
+from siftwise.cli.pygraph import PyGraph, build_py_graph, module_of_test
+from siftwise.cli.repoconfig import load_repo_config, read_go_module
+from siftwise.core.selector import (
     FailedRun,
     KnownTest,
     Mode,
@@ -74,7 +74,7 @@ from sieve.core.selector import (
     pytest_file,
     select_tests,
 )
-from sieve.db import get_sessionmaker
+from siftwise.db import get_sessionmaker
 
 FAILED = ("failed", "error")
 # Main CI runs read to recompute broken-on-main per target (see broken_on_main_before).
@@ -738,7 +738,7 @@ def evaluate(
     elif not any(p.endswith(".py") for p in changed):
         graph_note = "python: no Python file changed"
     else:
-        # As `sieve select` does: the static import graph at the target's commit.
+        # As `siftwise select` does: the static import graph at the target's commit.
         py_graph = graphs.py_graph_at(run.commit_sha)
         if py_graph is None:
             graph_note = f"python: no import graph at {run.commit_sha[:7]}"
@@ -925,7 +925,7 @@ def _github_token() -> str | None:
 
 
 def main(
-    repo: Annotated[str, typer.Option(help="Repository name in sieve, e.g. RDFLib/rdflib.")],
+    repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. RDFLib/rdflib.")],
     runs: Annotated[int, typer.Option(min=1, help="Most recent PR runs to evaluate.")] = 10,
     failing: Annotated[
         bool, typer.Option("--failing", help="Also evaluate every PR run that had failures.")
@@ -939,7 +939,7 @@ def main(
     go_module: Annotated[
         str | None, typer.Option(help="Go module path (default: from the checkout's go.mod).")
     ] = None,
-    sieve_toml: Annotated[
+    siftwise_toml: Annotated[
         Path | None, typer.Option(help="Repo config with [[depends]] / always_run.")
     ] = None,
     checkout: Annotated[
@@ -955,7 +955,7 @@ def main(
     if checkout and not go_module:
         go_module = read_go_module(checkout)
     is_go = language == "go" or (language == "auto" and go_module is not None)
-    repo_config = load_repo_config(sieve_toml) if sieve_toml else None
+    repo_config = load_repo_config(siftwise_toml) if siftwise_toml else None
     config = SelectorConfig(
         go_module=go_module,
         depends=repo_config.depends if repo_config else (),

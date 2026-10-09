@@ -1,4 +1,4 @@
-"""`sieve` command-line interface."""
+"""`siftwise` command-line interface."""
 
 import json
 import os
@@ -9,10 +9,10 @@ from typing import Annotated, Any
 import httpx
 import typer
 
-from sieve import __version__
-from sieve.cli.gograph import build_graph, run_go_list
-from sieve.cli.pygraph import build_py_graph
-from sieve.cli.repoconfig import (
+from siftwise import __version__
+from siftwise.cli.gograph import build_graph, run_go_list
+from siftwise.cli.pygraph import build_py_graph
+from siftwise.cli.repoconfig import (
     FILE_NAME,
     RepoConfig,
     RepoConfigError,
@@ -20,9 +20,9 @@ from sieve.cli.repoconfig import (
     read_go_module,
 )
 
-app = typer.Typer(help="Sieve: test impact analysis for CI.", no_args_is_help=True)
+app = typer.Typer(help="Siftwise: test impact analysis for CI.", no_args_is_help=True)
 
-# `sieve select` exit codes, besides 0 (success, including "no tests affected").
+# `siftwise select` exit codes, besides 0 (success, including "no tests affected").
 EXIT_API_ERROR = 1
 EXIT_USAGE = 2
 EXIT_FULL_SUITE_NO_COMMAND = 3
@@ -30,21 +30,21 @@ EXIT_FULL_SUITE_NO_COMMAND = 3
 
 @app.callback()
 def main() -> None:
-    """Sieve: test impact analysis for CI."""
+    """Siftwise: test impact analysis for CI."""
 
 
 @app.command()
 def version() -> None:
-    """Print the sieve version."""
+    """Print the siftwise version."""
     typer.echo(__version__)
 
 
 @app.command("select")
 def select_command(
-    repo: Annotated[str, typer.Option(help="Repository name in sieve, e.g. acme/shop.")],
+    repo: Annotated[str, typer.Option(help="Repository name in siftwise, e.g. acme/shop.")],
     base: Annotated[str, typer.Option(help="Base ref to diff against.")] = "main",
     head: Annotated[str, typer.Option(help="Head ref.")] = "HEAD",
-    server: Annotated[str, typer.Option(help="sieve server URL.")] = "http://localhost:8000",
+    server: Annotated[str, typer.Option(help="siftwise server URL.")] = "http://localhost:8000",
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the full API response as JSON.")
     ] = False,
@@ -62,13 +62,13 @@ def select_command(
 ) -> None:
     """Print the test command for the changes in BASE...HEAD.
 
-    The command goes to stdout (so `eval "$(sieve select ...)"` works); the mode and reason go
-    to stderr. Needs SIEVE_API_TOKEN. Exit codes: 0 ok (stdout is empty if no tests are
+    The command goes to stdout (so `eval "$(siftwise select ...)"` works); the mode and reason go
+    to stderr. Needs SIFTWISE_API_TOKEN. Exit codes: 0 ok (stdout is empty if no tests are
     affected), 1 API error, 2 usage error, 3 full suite needed but no command is known.
     """
-    token = os.environ.get("SIEVE_API_TOKEN")
+    token = os.environ.get("SIFTWISE_API_TOKEN")
     if not token:
-        _err("error: set SIEVE_API_TOKEN")
+        _err("error: set SIFTWISE_API_TOKEN")
         raise typer.Exit(EXIT_USAGE)
 
     root = git_toplevel() or Path.cwd()
@@ -105,10 +105,10 @@ def select_command(
             timeout=60,
         )
     except httpx.HTTPError as exc:
-        _err(f"error: could not reach sieve at {server}: {exc}")
+        _err(f"error: could not reach siftwise at {server}: {exc}")
         raise typer.Exit(EXIT_API_ERROR) from exc
     if response.status_code != httpx.codes.OK:
-        _err(f"error: sieve returned {response.status_code}: {_detail(response)}")
+        _err(f"error: siftwise returned {response.status_code}: {_detail(response)}")
         raise typer.Exit(EXIT_API_ERROR)
 
     result: dict[str, Any] = response.json()
@@ -117,14 +117,14 @@ def select_command(
         return
 
     _err(
-        f"sieve: {result['mode']} ({result['selected_count']} of {result['total_known']} "
+        f"siftwise: {result['mode']} ({result['selected_count']} of {result['total_known']} "
         f"known tests): {result['reason']}"
     )
     if result["command"]:
         typer.echo(result["command"])
     elif result["mode"] == "full":
         # Never let "run nothing" be mistaken for "run everything".
-        _err("error: the full suite is needed, but sieve knows no command for this repo's tests")
+        _err("error: the full suite is needed, but siftwise knows no command for this repo's tests")
         raise typer.Exit(EXIT_FULL_SUITE_NO_COMMAND)
 
 
@@ -148,7 +148,7 @@ def go_dependents(root: Path, changed: list[str]) -> dict[str, list[str]]:
         return {}
     affected = build_graph(packages, root).affected(changed)
     if affected:
-        _err(f"sieve: go list: {len(affected)} package(s) depend on changed Go code")
+        _err(f"siftwise: go list: {len(affected)} package(s) depend on changed Go code")
     return affected
 
 
@@ -161,7 +161,7 @@ def python_dependents(root: Path, changed: list[str]) -> dict[str, list[str]]:
         return {}
     affected = graph.affected(changed)
     if affected:
-        _err(f"sieve: python imports: {len(affected)} test file(s) import changed modules")
+        _err(f"siftwise: python imports: {len(affected)} test file(s) import changed modules")
     return affected
 
 

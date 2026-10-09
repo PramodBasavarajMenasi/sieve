@@ -1,17 +1,19 @@
+name: siftwise
+
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: sieve
-      POSTGRES_PASSWORD: sieve
-      POSTGRES_DB: sieve
+      POSTGRES_USER: siftwise
+      POSTGRES_PASSWORD: siftwise
+      POSTGRES_DB: siftwise
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sieve -d sieve"]
+      test: ["CMD-SHELL", "pg_isready -U siftwise -d siftwise"]
       interval: 2s
       timeout: 3s
       retries: 15
@@ -19,8 +21,8 @@ services:
   api:
     build: .
     environment:
-      SIEVE_DATABASE_URL: postgresql+psycopg://sieve:sieve@postgres:5432/sieve
-      SIEVE_API_TOKEN: ${SIEVE_API_TOKEN:-dev-token}
+      SIFTWISE_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@postgres:5432/siftwise
+      SIFTWISE_API_TOKEN: ${SIFTWISE_API_TOKEN:-dev-token}
     ports:
       - "8000:8000"
     depends_on:
@@ -29,3 +31,6 @@ services:
 
 volumes:
   pgdata:
+    # Docker volumes can't be renamed: an install from before the sieve → siftwise rename sets
+    # SIFTWISE_PG_VOLUME=sieve_pgdata in .env to keep its data.
+    name: ${SIFTWISE_PG_VOLUME:-siftwise_pgdata}

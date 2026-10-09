@@ -27,20 +27,20 @@ jobs:
         # Docker Hub on shared GitHub runners hit its rate limit ("toomanyrequests").
         image: public.ecr.aws/docker/library/postgres:16-alpine
         env:
-          POSTGRES_USER: sieve
-          POSTGRES_PASSWORD: sieve
-          POSTGRES_DB: sieve_test
+          POSTGRES_USER: siftwise
+          POSTGRES_PASSWORD: siftwise
+          POSTGRES_DB: siftwise_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U sieve -d sieve_test"
+          --health-cmd "pg_isready -U siftwise -d siftwise_test"
           --health-interval 2s
           --health-timeout 3s
           --health-retries 15
 
     env:
       # Without it the database tests are skipped.
-      SIEVE_TEST_DATABASE_URL: postgresql+psycopg://sieve:sieve@localhost:5432/sieve_test
+      SIFTWISE_TEST_DATABASE_URL: postgresql+psycopg://siftwise:siftwise@localhost:5432/siftwise_test
 
     steps:
       - uses: actions/checkout@v4

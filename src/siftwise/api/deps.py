@@ -2,7 +2,7 @@
 
 from fastapi import Request
 
-from sieve.config import Settings
+from siftwise.config import Settings
 
 
 def get_app_settings(request: Request) -> Settings:

@@ -6,7 +6,7 @@ from functools import lru_cache
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from sieve.config import get_settings
+from siftwise.config import get_settings
 
 
 @lru_cache

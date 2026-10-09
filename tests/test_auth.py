@@ -7,9 +7,9 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from sieve.api.auth import BearerAuthMiddleware
-from sieve.api.main import create_app
-from sieve.config import Settings
+from siftwise.api.auth import BearerAuthMiddleware
+from siftwise.api.main import create_app
+from siftwise.config import Settings
 
 TOKEN = "s3cret"
 

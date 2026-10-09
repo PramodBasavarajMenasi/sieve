@@ -1,4 +1,4 @@
-# .sieve.toml for ipfs/kubo, used by scripts/eval_kubo.py (kubo itself has none).
+# .siftwise.toml for ipfs/kubo, used by scripts/eval_kubo.py (kubo itself has none).
 #
 # test/cli runs the built `ipfs` binary, so it depends on every non-test Go file linked into
 # ./cmd/ipfs, with no Go import edge to that code. Approximated here as "any non-test Go

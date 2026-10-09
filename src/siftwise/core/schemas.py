@@ -12,7 +12,7 @@ from pydantic import (
     field_validator,
 )
 
-from sieve.core.junit import Status, normalize_path
+from siftwise.core.junit import Status, normalize_path
 
 NonEmpty255 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 
@@ -103,7 +103,7 @@ Glob = Annotated[str, StringConstraints(min_length=1, max_length=1024)]
 
 
 class DependsRuleIn(BaseModel):
-    """A ``[[depends]]`` rule from the repo's .sieve.toml."""
+    """A ``[[depends]]`` rule from the repo's .siftwise.toml."""
 
     model_config = ConfigDict(extra="forbid")
 

@@ -10,11 +10,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from sieve.api.main import create_app
-from sieve.config import Settings
-from sieve.core.junit import Status
-from sieve.core.models import ChangedFile, Repo, Run, TestResult
-from sieve.db import get_session
+from siftwise.api.main import create_app
+from siftwise.config import Settings
+from siftwise.core.junit import Status
+from siftwise.core.models import ChangedFile, Repo, Run, TestResult
+from siftwise.db import get_session
 
 FIXTURES = Path(__file__).parent / "fixtures"
 TOKEN = "test-token"
@@ -211,7 +211,7 @@ def test_concurrent_duplicate_returns_existing_run(
 ) -> None:
     first = post_run(client, [fixture("pytest.xml")])
     # Simulate losing the race: the pre-check misses, so the insert hits the unique constraint.
-    monkeypatch.setattr("sieve.api.routes.runs.find_existing_run", lambda session, meta: None)
+    monkeypatch.setattr("siftwise.api.routes.runs.find_existing_run", lambda session, meta: None)
 
     second = post_run(client, [fixture("pytest.xml")])
 
@@ -247,7 +247,7 @@ def test_concurrent_reupload_with_different_commit_returns_409(
     client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert post_run(client, [fixture("pytest.xml")]).status_code == 201
-    monkeypatch.setattr("sieve.api.routes.runs.find_existing_run", lambda session, meta: None)
+    monkeypatch.setattr("siftwise.api.routes.runs.find_existing_run", lambda session, meta: None)
 
     response = post_run(client, [fixture("pytest.xml")], metadata(commit_sha=OTHER_SHA))
 
@@ -371,7 +371,7 @@ def test_concurrent_duplicate_of_a_variant_returns_existing_run(
     client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first = post_run(client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12"))
-    monkeypatch.setattr("sieve.api.routes.runs.find_existing_run", lambda session, meta: None)
+    monkeypatch.setattr("siftwise.api.routes.runs.find_existing_run", lambda session, meta: None)
 
     second = post_run(client, [fixture("go.xml")], metadata(variant="ubuntu-py3.12"))
 
@@ -435,7 +435,7 @@ def test_unconfigured_token_fails_closed(db_session: Session) -> None:
     with make_client(db_session, api_token=None) as client:
         response = post_run(client, [fixture("pytest.xml")])
     assert response.status_code == 503
-    assert "SIEVE_API_TOKEN" in response.json()["detail"]
+    assert "SIFTWISE_API_TOKEN" in response.json()["detail"]
 
 
 # --- bad input ----------------------------------------------------------------------------

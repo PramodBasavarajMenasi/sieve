@@ -1,6 +1,6 @@
 """Static Python import graph of a checkout, for selecting tests that import changed code.
 
-``sieve select`` builds it at the repo root (like ``go list`` for Go) and sends
+``siftwise select`` builds it at the repo root (like ``go list`` for Go) and sends
 ``PyGraph.affected(changed_files)`` as ``affected_files``: every test file that imports a
 changed module, directly or transitively. The eval also uses it to explain misses.
 
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sieve.core.selector import is_python_test_file
+from siftwise.core.selector import is_python_test_file
 
 SKIP_DIRS = frozenset(
     {".git", ".venv", "venv", ".tox", ".nox", "build", "dist", "node_modules", ".eggs",

@@ -7,12 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sieve.api.deps import get_app_settings
-from sieve.config import Settings
-from sieve.core.history import recompute_repo_stats
-from sieve.core.models import Repo
-from sieve.core.schemas import RollupResponse
-from sieve.db import get_session
+from siftwise.api.deps import get_app_settings
+from siftwise.config import Settings
+from siftwise.core.history import recompute_repo_stats
+from siftwise.core.models import Repo
+from siftwise.core.schemas import RollupResponse
+from siftwise.db import get_session
 
 router = APIRouter()
 

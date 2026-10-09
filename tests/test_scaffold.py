@@ -2,10 +2,10 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from sieve import __version__
-from sieve.api.main import app
-from sieve.cli.main import app as cli_app
-from sieve.config import Settings
+from siftwise import __version__
+from siftwise.api.main import app
+from siftwise.cli.main import app as cli_app
+from siftwise.config import Settings
 
 
 def test_healthz() -> None:
@@ -15,8 +15,8 @@ def test_healthz() -> None:
 
 
 def test_settings_read_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SIEVE_DATABASE_URL", "postgresql+psycopg://u:p@db/x")
-    monkeypatch.setenv("SIEVE_API_TOKEN", "secret")
+    monkeypatch.setenv("SIFTWISE_DATABASE_URL", "postgresql+psycopg://u:p@db/x")
+    monkeypatch.setenv("SIFTWISE_API_TOKEN", "secret")
     settings = Settings(_env_file=None)
     assert settings.database_url == "postgresql+psycopg://u:p@db/x"
     assert settings.api_token == "secret"

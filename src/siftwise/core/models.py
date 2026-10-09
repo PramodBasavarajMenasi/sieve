@@ -27,7 +27,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, column_property, mapped_column
 
-from sieve.core.junit import Status
+from siftwise.core.junit import Status
 
 # Deterministic constraint names so Alembic autogenerate and downgrades are stable.
 NAMING_CONVENTION = {

@@ -5,8 +5,8 @@ from sqlalchemy import Engine, func, insert, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from sieve.core.junit import Status
-from sieve.core.models import (
+from siftwise.core.junit import Status
+from siftwise.core.models import (
     MESSAGE_MAX_BYTES,
     TRUNCATION_MARKER,
     Base,

@@ -14,15 +14,13 @@ counts. For each target R:
    earlier than R by ``COALESCE(started_at, created_at)``. ``test_stats`` is not used for
    selection; broken-on-main is recomputed per variant from raw results. The repo's raw
    results are read once into memory (``HistoryIndex``), so each target is cheap.
-2. Go repos: with ``--checkout`` (+ ``--go``), compute the Go import graph at R's commit
-   (``go list -deps -test -json ./...``, cached per commit) and pass it to the selector, as
-   ``sieve select`` does.
+2. With ``--checkout``, compute the import graph at R's commit (cached per commit) and pass it
+   to the selector, as ``sieve select`` does: for Go ``go list -deps -test -json ./...``
+   (needs ``--go``), for Python the static graph from ``sieve.cli.pygraph``.
 3. Run ``select_tests`` with the repo config from ``--sieve-toml``.
 4. Compare with the tests that actually failed in R. A failure is caught if the selection's
-   commands would run it.
-5. Explain each miss with the signal that would have caught it. For Python repos with
-   ``--checkout``, a static import graph at R's commit (``scripts/eval/pygraph.py``; eval
-   only, not a selector signal) shows whether the test imports a changed module.
+   commands would run it (including new tests in a Python file or Go package run whole).
+5. Explain each miss with the signal that would have caught it.
 6. Report tests and estimated runtime skipped (each top-level test's average duration from
    test_stats; sizes the savings only, never affects selection).
 
@@ -59,8 +57,8 @@ from sqlalchemy.orm import Session
 if not __package__:  # run as a file path: make the repo root importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.eval.pygraph import PyGraph, build_py_graph, module_of_test
 from sieve.cli.gograph import GoGraph, build_graph, parse_go_list
+from sieve.cli.pygraph import PyGraph, build_py_graph, module_of_test
 from sieve.cli.repoconfig import load_repo_config, read_go_module
 from sieve.core.selector import (
     FailedRun,
@@ -73,6 +71,7 @@ from sieve.core.selector import (
     build_file_scope,
     is_build_file,
     is_ignorable,
+    pytest_file,
     select_tests,
 )
 from sieve.db import get_sessionmaker
@@ -522,6 +521,9 @@ class GraphProvider:
         cache.write_text(json.dumps(graph.to_json()))
         return graph, f"import graph at {sha[:7]}"
 
+    def has_py_graph(self, sha: str) -> bool:
+        return (self.cache_dir / f"pygraph-{sha}.json").exists()
+
     def py_graph_at(self, sha: str) -> PyGraph | None:
         cache = self.cache_dir / f"pygraph-{sha}.json"
         if cache.exists():
@@ -548,23 +550,37 @@ class GraphProvider:
 # --- evaluation ---------------------------------------------------------------------------
 
 
+class WouldRun:
+    """Whether a selection's commands would execute a test (precomputed for many lookups)."""
+
+    def __init__(self, selection: Selection) -> None:
+        self.full = selection.mode is Mode.FULL
+        self.selected = {t.test_id for t in selection.tests}
+        self.go_packages = set(selection.go_packages_run_whole)
+        self.py_files = set(selection.python_files_run_whole)
+        # go test -run '^(TestX)$' runs TestX with all of its subtests.
+        self.go_top_level = {
+            (package, name.split("/", 1)[0])
+            for t in selection.tests
+            if t.runner is Runner.GO
+            for package, _, name in [t.test_id.partition("::")]
+        }
+
+    def __call__(self, test_id: str) -> bool:
+        if self.full or test_id in self.selected:
+            return True
+        package, _, name = test_id.partition("::")
+        if package in self.go_packages:
+            return True  # `go test ./pkg` with no -run: every test in the package, new ones too
+        if (package, name.split("/", 1)[0]) in self.go_top_level:
+            return True
+        # `pytest path/test_x.py`: every test in the file, new ones too.
+        return bool(self.py_files) and pytest_file(test_id) in self.py_files
+
+
 def would_run(selection: Selection, test_id: str) -> bool:
     """Whether the selection's commands would execute ``test_id``."""
-    if selection.mode is Mode.FULL:
-        return True
-    if any(t.test_id == test_id for t in selection.tests):
-        return True
-    package, _, name = test_id.partition("::")
-    if package in selection.go_packages_run_whole:
-        return True  # `go test ./pkg` with no -run: every test in the package, new ones too
-    top_level = name.split("/", 1)[0]
-    # go test -run '^(TestX)$' runs TestX with all of its subtests.
-    return any(
-        t.runner is Runner.GO
-        and t.test_id.partition("::")[0] == package
-        and t.test_id.partition("::")[2].split("/", 1)[0] == top_level
-        for t in selection.tests
-    )
+    return WouldRun(selection)(test_id)
 
 
 @dataclass(frozen=True)
@@ -660,20 +676,26 @@ def counterfactual(
     failures: list[str],
     config: SelectorConfig,
     affected: dict[str, list[str]],
+    affected_files: dict[str, list[str]],
     explain: Explainer,
 ) -> Counterfactual:
     """Select from only the changed files that are covered by a signal on their own."""
+
+    def select(files: list[str]) -> Selection:
+        return select_tests(history, files, True, config, affected, affected_files)
+
     mapped = [
         p
         for p in changed
         if (not is_build_file(p) or build_file_scope(p) is not None)
         and not is_ignorable(p)
-        and select_tests(history, [p], True, config, affected).mode is Mode.SELECTIVE
+        and select([p]).mode is Mode.SELECTIVE
     ]
     if not mapped:
         return Counterfactual([], None, [], [])
-    selection = select_tests(history, mapped, True, config, affected)
-    caught = [f for f in failures if would_run(selection, f)]
+    selection = select(mapped)
+    runs = WouldRun(selection)
+    caught = [f for f in failures if runs(f)]
     missed = [explain(f) for f in failures if f not in caught]
     return Counterfactual(mapped, selection, caught, missed)
 
@@ -687,7 +709,8 @@ def skipped_pcts(
     tests_pct = 100 * (1 - selection.selected_count / len(history.tests))
     top_level = [t for t in history.tests if t in durations]
     total = sum(durations[t] for t in top_level)
-    run = sum(durations[t] for t in top_level if would_run(selection, t))
+    runs = WouldRun(selection)
+    run = sum(durations[t] for t in top_level if runs(t))
     time_pct = 100 * (1 - run / total) if total else 0.0
     return tests_pct, time_pct
 
@@ -704,23 +727,33 @@ def evaluate(
     history = index.history_before(run, config)
     known = run.changed_files is not None
     changed = list(run.changed_files or ())
+    graph: GoGraph | None = None
+    affected_files: dict[str, list[str]] = {}
     if not known:
-        graph, graph_note = None, "diff unknown"
+        graph_note = "diff unknown"
     elif go:
         graph, graph_note = graphs.go_graph_at(run.commit_sha)
+    elif graphs.checkout is None and not graphs.has_py_graph(run.commit_sha):
+        graph_note = "python: no --checkout, no import graph"
+    elif not any(p.endswith(".py") for p in changed):
+        graph_note = "python: no Python file changed"
     else:
-        graph = None
-        graph_note = "python: import graph only for explaining misses"
-        if graphs.checkout is None:
-            graph_note = "python: no --checkout, misses can't be traced through imports"
+        # As `sieve select` does: the static import graph at the target's commit.
+        py_graph = graphs.py_graph_at(run.commit_sha)
+        if py_graph is None:
+            graph_note = f"python: no import graph at {run.commit_sha[:7]}"
+        else:
+            affected_files = py_graph.affected(changed)
+            graph_note = f"python imports at {run.commit_sha[:7]}"
     affected = graph.affected(changed) if graph else {}
     explain = Explainer(history, changed, config.go_module, go, graph, graphs, run.commit_sha)
-    selection = select_tests(history, changed, known, config, affected)
+    selection = select_tests(history, changed, known, config, affected, affected_files)
     failures = actual_failures(session, list(run.run_ids or (run.run_id,)))
-    caught = [f for f in failures if would_run(selection, f)]
+    runs = WouldRun(selection)
+    caught = [f for f in failures if runs(f)]
     missed = [explain(f) for f in failures if f not in caught]
     cf = (
-        counterfactual(history, changed, failures, config, affected, explain)
+        counterfactual(history, changed, failures, config, affected, affected_files, explain)
         if failures and selection.mode is Mode.FULL and known
         else None
     )
@@ -738,6 +771,7 @@ def evaluate(
 def _signal(reason: str) -> str:
     for prefix, name in (
         ("imports changed package", "go imports"),
+        ("imports changed module", "python imports"),
         ("declared dependency", "declared"),
         ("co-change", "co-change"),
         ("failed on main", "recently failed"),

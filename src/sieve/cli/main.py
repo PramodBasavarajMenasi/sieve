@@ -11,6 +11,7 @@ import typer
 
 from sieve import __version__
 from sieve.cli.gograph import build_graph, run_go_list
+from sieve.cli.pygraph import build_py_graph
 from sieve.cli.repoconfig import (
     FILE_NAME,
     RepoConfig,
@@ -51,6 +52,13 @@ def select_command(
         bool,
         typer.Option(help="For Go repos, run `go list` to select tests of dependent packages."),
     ] = True,
+    py_imports: Annotated[
+        bool,
+        typer.Option(
+            help="When Python files changed, build a static import graph to select test files "
+            "that import changed modules."
+        ),
+    ] = True,
 ) -> None:
     """Print the test command for the changes in BASE...HEAD.
 
@@ -71,7 +79,8 @@ def select_command(
         _err(f"error: {exc}")
         raise typer.Exit(EXIT_USAGE) from exc
 
-    changed = git_changed_files(base, head)
+    diff = git_diff(base, head)
+    changed = diff[0] if diff else None
     body: dict[str, Any] = {
         "repo": repo,
         "changed_files": changed or [],
@@ -79,11 +88,15 @@ def select_command(
         "depends": [{"tests": r.tests, "on": list(r.on)} for r in config.depends],
         "always_run": list(config.always_run),
     }
+    if diff and diff[1]:
+        body["deleted_files"] = diff[1]
     go_module = read_go_module(root)
     if go_module:
         body["go_module"] = go_module
         if go_list and changed:
             body["affected_packages"] = go_dependents(root, changed)
+    if py_imports and changed and any(p.endswith(".py") for p in changed):
+        body["affected_files"] = python_dependents(root, changed)
     try:
         response = httpx.post(
             f"{server.rstrip('/')}/select",
@@ -139,8 +152,24 @@ def go_dependents(root: Path, changed: list[str]) -> dict[str, list[str]]:
     return affected
 
 
-def git_changed_files(base: str, head: str) -> list[str] | None:
-    """Files changed in ``base...head`` (renames give both paths), or None if git fails."""
+def python_dependents(root: Path, changed: list[str]) -> dict[str, list[str]]:
+    """Test files that import a changed module; empty (fallbacks apply) if the graph fails."""
+    try:
+        graph = build_py_graph(root)
+    except (OSError, ValueError, RecursionError) as exc:
+        _err(f"warning: could not build the Python import graph ({exc}); not selecting importers")
+        return {}
+    affected = graph.affected(changed)
+    if affected:
+        _err(f"sieve: python imports: {len(affected)} test file(s) import changed modules")
+    return affected
+
+
+def git_diff(base: str, head: str) -> tuple[list[str], list[str]] | None:
+    """``(changed, deleted)`` files in ``base...head``, or None if git fails.
+
+    Renames give both paths in ``changed``, and the old path in ``deleted``.
+    """
     args = ["git", "diff", "--name-status", "-z", "-M", f"{base}...{head}"]
     try:
         proc = subprocess.run(args, capture_output=True, timeout=120, check=False)
@@ -154,7 +183,20 @@ def git_changed_files(base: str, head: str) -> list[str] | None:
             " asking for the full suite"
         )
         return None
-    return parse_name_status(proc.stdout)
+    return parse_name_status(proc.stdout), parse_deleted(proc.stdout)
+
+
+def _name_status_entries(output: bytes) -> list[tuple[str, list[str]]]:
+    """``(status letter, paths)`` from ``git diff --name-status -z``."""
+    fields = output.decode("utf-8", errors="replace").split("\0")
+    entries = []
+    i = 0
+    while i < len(fields) and fields[i]:
+        status = fields[i]
+        count = 2 if status[0] in "RC" else 1
+        entries.append((status[0], fields[i + 1 : i + 1 + count]))
+        i += 1 + count
+    return entries
 
 
 def parse_name_status(output: bytes) -> list[str]:
@@ -163,16 +205,16 @@ def parse_name_status(output: bytes) -> list[str]:
     Renames contribute both the old and the new path; copies only the new one (the source
     is unchanged).
     """
-    fields = output.decode("utf-8", errors="replace").split("\0")
     paths: list[str] = []
-    i = 0
-    while i < len(fields) and fields[i]:
-        status = fields[i]
-        count = 2 if status[0] in "RC" else 1
-        entry = fields[i + 1 : i + 1 + count]
-        paths.extend(entry[1:] if status[0] == "C" else entry)
-        i += 1 + count
+    for status, entry in _name_status_entries(output):
+        paths.extend(entry[1:] if status == "C" else entry)
     return list(dict.fromkeys(paths))
+
+
+def parse_deleted(output: bytes) -> list[str]:
+    """Paths that no longer exist at head: deleted files and the old side of renames."""
+    deleted = [entry[0] for status, entry in _name_status_entries(output) if status in "DR"]
+    return list(dict.fromkeys(deleted))
 
 
 def _detail(response: httpx.Response) -> str:

@@ -36,10 +36,16 @@ Tests are selected from:
 
 - **The changed files' own tests.** Python `foo.py` selects tests in `test_foo.py`. JS/TS
   `foo.ts` selects `foo.test.*`, `foo.spec.*` and `__tests__/foo.*`. A changed Go file runs its
-  whole package. A changed test file runs itself.
+  whole package. A changed or added Python test file runs whole, so new tests in it run.
 - **Go dependents.** In a Go module the CLI runs `go list -deps -test -json ./...` and selects
   every package whose tests import a changed package, directly or transitively. If `go list`
   fails, this is skipped; use `--no-go-list` to skip it on purpose.
+- **Python importers.** When `.py` files changed, the CLI builds a static import graph of the
+  checkout (parent packages, `conftest.py` files, and module names in strings such as plugin
+  registries) and runs every test file that imports a changed module. If the graph can't be
+  built, this is skipped; use `--no-py-imports` to skip it on purpose. Doctests run with
+  `pytest --doctest-modules`, and if the repo's history shows it collects source modules,
+  changed modules run that way too.
 - **History.** Tests that failed in earlier runs touching the same files (co-change), and
   tests that recently failed or are broken on main.
 - **`.sieve.toml`** at the repo root, for dependencies sieve can't see. An example is a test

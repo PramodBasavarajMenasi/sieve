@@ -121,6 +121,24 @@ def test_affected_packages_and_go_module(client: TestClient) -> None:
 
 
 @pytest.mark.usefixtures("seeded")
+def test_affected_files_and_deleted_files(client: TestClient) -> None:
+    # money.py has no test_money.py; test_db.py imports it (per the CLI's import graph).
+    body = post_select(
+        client,
+        changed_files=["src/shop/money.py", "tests/test_cart.py"],
+        affected_files={"tests/test_db.py": ["src/shop/money.py"]},
+        deleted_files=["tests/test_cart.py"],
+    ).json()
+
+    assert body["mode"] == "selective", body["reason"]
+    assert body["commands"] == ["pytest tests/test_db.py"]  # deleted test_cart.py: not named
+    assert body["python_files_run_whole"] == ["tests/test_db.py"]
+    assert [(t["test_id"], t["reason"]) for t in body["tests"]] == [
+        ("tests.test_db::test_query", "imports changed module src/shop/money.py")
+    ]
+
+
+@pytest.mark.usefixtures("seeded")
 def test_declared_dependencies_and_always_run(client: TestClient) -> None:
     body = post_select(
         client,

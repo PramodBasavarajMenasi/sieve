@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scripts.eval import run_eval as ev
-from scripts.eval.pygraph import PyGraph
+from sieve.cli.pygraph import PyGraph
 from sieve.core.ingest import create_run
 from sieve.core.junit import ParsedTestResult, Status
 from sieve.core.schemas import RunMetadata
@@ -59,6 +59,16 @@ def test_whole_go_package_runs_every_test_in_it_including_new_ones() -> None:
     sel = selection((f"{PKG}::TestOld", Runner.GO), whole=(PKG,))
     assert ev.would_run(sel, f"{PKG}::TestBrandNew/sub")
     assert not ev.would_run(sel, "github.com/acme/shop/pay::TestOld")
+
+
+def test_whole_python_file_runs_every_test_in_it_including_new_ones() -> None:
+    sel = Selection(
+        mode=Mode.SELECTIVE, reason="", tests=(), selected_count=0, total_known=10, commands=(),
+        python_files_run_whole=("tests/test_cart.py", "rdflib/container.py"),
+    )  # fmt: skip
+    assert ev.would_run(sel, "tests.test_cart.TestNew::test_brand_new")
+    assert ev.would_run(sel, "rdflib.container::rdflib.container.Seq")  # doctest module
+    assert not ev.would_run(sel, "tests.test_other::test_x")
 
 
 def test_go_run_filter_covers_subtests_of_selected_top_level_tests() -> None:

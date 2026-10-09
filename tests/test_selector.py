@@ -23,6 +23,7 @@ from sieve.core.selector import (
     glob_match,
     is_build_file,
     load_history,
+    pytest_file,
     select_for_repo,
     select_tests,
 )
@@ -148,7 +149,6 @@ def test_no_history_runs_the_full_suite(hist: RepoHistory | None) -> None:
         "src/shop/__init__.py",
         "proto/shop.proto",  # unknown language
         "tests/fixtures/order.json",  # test data
-        "tests/test_new.py",  # a new test file has no known tests yet
     ],
 )
 def test_source_file_with_no_tests_runs_the_full_suite(path: str) -> None:
@@ -214,7 +214,7 @@ def test_python_file_path_attribute_is_used_when_present() -> None:
     selection = select(hist, "src/pkg/tests/test_cart.py")
 
     assert ids(selection) == ["pkg.test_cart::test_total"]
-    assert selection.commands == ("pytest src/pkg/tests/test_cart.py::test_total",)
+    assert selection.commands == ("pytest src/pkg/tests/test_cart.py",)
 
 
 def test_python_module_with_custom_name_uses_file_path() -> None:
@@ -222,7 +222,8 @@ def test_python_module_with_custom_name_uses_file_path() -> None:
     hist = history(("tests.check_cart.CartChecks::test_total", "tests/check_cart.py"))
     selection = select(hist, "tests/check_cart.py")
 
-    assert selection.commands == ("pytest tests/check_cart.py::CartChecks::test_total",)
+    # Changed, so it runs whole; known by its file_path even without a test_*.py name.
+    assert selection.commands == ("pytest tests/check_cart.py",)
 
 
 # --- path mapping: Go ---------------------------------------------------------------------
@@ -643,6 +644,8 @@ def test_collection_error_of_a_source_module_runs_that_module() -> None:
     assert ids(selection) == [SOURCE_MODULE_ERROR, "test.test_sparql.test_parser::test_x"]
     assert selection.commands == (
         "pytest rdflib/plugins/serializers/n3.py test/test_sparql/test_parser.py::test_x",
+        # a collection error in a source module: the repo imports modules, so parser.py runs
+        "{ pytest --doctest-modules rdflib/plugins/sparql/parser.py || test $? -eq 5; }",
     )
     [error] = [t for t in selection.tests if t.test_id == SOURCE_MODULE_ERROR]
     assert error.runner is Runner.PYTEST
@@ -671,6 +674,7 @@ def test_collection_error_file_path_attribute_wins() -> None:
                    recent_main_failures={"pytest::shop.cart": (5, "e" * 40)})  # fmt: skip
     assert select(hist, "src/shop/cart.py").commands == (
         "pytest src/shop/cart.py tests/test_cart.py::test_total",
+        "{ pytest --doctest-modules src/shop/cart.py || test $? -eq 5; }",
     )
 
 
@@ -695,6 +699,174 @@ def test_only_underivable_collection_errors_give_an_empty_command() -> None:
     selection = select(hist, "README.md")
 
     assert (selection.mode, ids(selection), selection.command) == (Mode.SELECTIVE, [error], "")
+
+
+# --- doctests -----------------------------------------------------------------------------
+
+DOCTEST = "rdflib.container::rdflib.container.Container"
+MODULE_DOCTEST = "rdflib.container::rdflib.container"
+
+
+def test_doctests_run_their_module_with_doctest_modules() -> None:
+    hist = history(DOCTEST, MODULE_DOCTEST, "test.test_cart::test_total",
+                   recent_main_failures={DOCTEST: (5, "e" * 40)})  # fmt: skip
+    selection = select(hist, "rdflib/container.py", "src/cart.py")
+
+    assert selection.mode is Mode.SELECTIVE
+    assert set(ids(selection)) == {DOCTEST, MODULE_DOCTEST, "test.test_cart::test_total"}
+    assert reasons(selection)[MODULE_DOCTEST] == "test file changed: rdflib/container.py"
+    assert selection.commands == (
+        "pytest test/test_cart.py::test_total",
+        # rdflib/container.py has known doctests; src/cart.py is imported for any it has
+        "{ pytest --doctest-modules rdflib/container.py src/cart.py || test $? -eq 5; }",
+    )
+    assert "rdflib/container.py" in selection.python_files_run_whole
+
+
+def test_changed_modules_run_with_doctest_modules_when_the_repo_collects_modules() -> None:
+    # History has a doctest, so the repo's pytest imports source modules: a new module that
+    # fails to import would show up as a collection error, so it must run.
+    hist = history(DOCTEST, "tests.test_cart::test_total")
+    affected = {"tests/test_cart.py": ["rdflib/inference/closure.py"]}
+    selection = select_tests(hist, ["rdflib/inference/closure.py", "tests/test_cart.py"], True,
+                             affected_files=affected)  # fmt: skip
+
+    assert selection.mode is Mode.SELECTIVE, selection.reason
+    assert selection.commands == (
+        "pytest tests/test_cart.py",
+        # no doctests in the new module: exit 5 is fine; import errors (2) still fail
+        "{ pytest --doctest-modules rdflib/inference/closure.py || test $? -eq 5; }",
+    )
+    assert "rdflib/inference/closure.py" in selection.python_files_run_whole
+
+
+def test_collection_error_in_a_source_module_also_shows_the_repo_collects_modules() -> None:
+    hist = history(SOURCE_MODULE_ERROR, "tests.test_cart::test_total")
+    selection = select_tests(hist, ["src/cart.py"], True)
+    assert selection.commands[-1].startswith("{ pytest --doctest-modules src/cart.py")
+
+
+def test_changed_modules_are_not_imported_when_the_repo_does_not_collect_modules() -> None:
+    # Only a collection error in a *test* module: no evidence of --doctest-modules.
+    hist = history(TEST_MODULE_ERROR, "tests.test_cart::test_total")
+    selection = select_tests(hist, ["src/cart.py"], True)
+    assert selection.commands == ("pytest tests/test_cart.py::test_total",)
+
+
+@pytest.mark.parametrize("test_id", ["my-pkg.mod::my-pkg.mod.f", "a..b::a..b.f"])
+def test_doctest_without_a_derivable_file_is_left_out_of_the_command(test_id: str) -> None:
+    hist = history(test_id, "tests.test_cart::test_total",
+                   recent_main_failures={test_id: (5, "e" * 40)})  # fmt: skip
+    selection = select(hist, "src/cart.py")
+
+    assert selection.mode is Mode.SELECTIVE, selection.reason
+    assert selection.commands == ("pytest tests/test_cart.py::test_total",)
+
+
+@pytest.mark.parametrize(
+    "test_id",
+    [
+        "tests.test_cart::test_total",  # a test function
+        "tests.test_cart::test_param[tests.test_cart.x]",
+        "com.acme.CartTest::testTotal",  # Java
+        f"{CLI}::TestAdd",  # Go
+        "Cart adds item::Cart adds item",  # jest-junit: classname = name, with spaces
+    ],
+)
+def test_ordinary_tests_are_not_doctests(test_id: str) -> None:
+    hist = history(test_id, recent_main_failures={test_id: (5, "e" * 40)})
+    selection = select(hist, "README.md")
+    assert "--doctest-modules" not in selection.command
+
+
+# --- Python test files and imports --------------------------------------------------------
+
+CART = "tests.test_cart::test_total"
+CART_CLASS = "tests.test_cart.TestDiscount::test_applies"
+IO = "tests.test_io::test_read"
+DEEP = "tests.unit.test_report::test_sum"
+
+
+def test_changed_test_file_runs_whole() -> None:
+    selection = select(history(CART, CART_CLASS, IO), "tests/test_cart.py")
+
+    assert set(ids(selection)) == {CART, CART_CLASS}
+    assert selection.commands == ("pytest tests/test_cart.py",)  # new tests in it run too
+    assert selection.python_files_run_whole == ("tests/test_cart.py",)
+
+
+def test_added_test_file_runs_whole_without_known_tests() -> None:
+    selection = select(history(CART, IO), "tests/test_new.py")
+
+    assert selection.mode is Mode.SELECTIVE  # not "maps to no known tests"
+    assert ids(selection) == []
+    assert selection.reason == "1 changed test file(s) run whole, no known tests"
+    assert selection.commands == ("pytest tests/test_new.py",)
+
+
+def test_deleted_test_file_runs_nothing() -> None:
+    # Its tests failed on main, but the file is gone: naming it would make pytest error out.
+    hist = history(CART, IO, recent_main_failures={CART: (5, "e" * 40)})
+    selection = select_tests(hist, ["tests/test_cart.py", "tests/test_io.py"], True,
+                             deleted_files=["tests/test_cart.py"])  # fmt: skip
+
+    assert ids(selection) == [IO]
+    assert selection.commands == ("pytest tests/test_io.py",)
+
+
+def test_test_files_importing_a_changed_module_run_whole() -> None:
+    hist = history(CART, IO, DEEP)
+    affected = {"tests/test_io.py": ["src/shop/money.py", "src/shop/cart.py"],
+                "tests/unit/test_report.py": ["src/shop/money.py"]}  # fmt: skip
+    selection = select_tests(hist, ["src/shop/money.py"], True, affected_files=affected)
+
+    # money.py has no test_money.py: without the import graph this was the full suite.
+    assert selection.mode is Mode.SELECTIVE
+    assert reasons(selection) == {
+        IO: "imports changed module src/shop/cart.py (+1 more)",
+        DEEP: "imports changed module src/shop/money.py",
+    }
+    assert selection.commands == ("pytest tests/test_io.py tests/unit/test_report.py",)
+    assert selection.python_files_run_whole == ("tests/test_io.py", "tests/unit/test_report.py")
+
+
+def test_imports_only_cover_the_modules_they_import() -> None:
+    affected = {"tests/test_io.py": ["src/shop/money.py"]}
+    selection = select_tests(history(CART, IO), ["src/shop/money.py", "src/shop/tax.py"], True,
+                             affected_files=affected)  # fmt: skip
+
+    assert selection.mode is Mode.FULL
+    assert selection.reason == "changed file maps to no known tests: src/shop/tax.py"
+
+
+def test_importing_test_files_without_known_tests_do_not_cover_a_change() -> None:
+    # An unknown test file may not even be collected by pytest: don't name it, stay safe.
+    affected = {"tests/test_unknown.py": ["src/shop/money.py"]}
+    selection = select_tests(history(CART), ["src/shop/money.py"], True, affected_files=affected)
+
+    assert selection.mode is Mode.FULL
+
+
+def test_whole_files_replace_node_ids_from_other_signals() -> None:
+    hist = history(CART, IO, recent_main_failures={CART: (5, "e" * 40)})
+    affected = {"tests/test_cart.py": ["src/shop/money.py"]}
+    selection = select_tests(hist, ["src/shop/money.py"], True, affected_files=affected)
+
+    assert selection.commands == ("pytest tests/test_cart.py",)
+
+
+@pytest.mark.parametrize(
+    ("test_id", "expected"),
+    [
+        (CART, "tests/test_cart.py"),
+        (CART_CLASS, "tests/test_cart.py"),
+        (DOCTEST, "rdflib/container.py"),
+        (SOURCE_MODULE_ERROR, "rdflib/plugins/serializers/n3.py"),
+        (f"{CLI}::TestAdd", None),
+    ],
+)
+def test_pytest_file(test_id: str, expected: str | None) -> None:
+    assert pytest_file(test_id) == expected
 
 
 def test_go_packages_with_changed_files_run_whole() -> None:

@@ -219,30 +219,29 @@ GitHub compares and import graphs are cached in `.eval-cache/`.
 
 ### Summary
 
-- **Most runs still go full.** Selective in 2 of the 10 most recent PR runs, 4 of 39 failing PR
-  runs, and 2 of 19 main commits. Estimated test time skipped across all runs: 19.3%, 10.2% and
-  9.9%.
-- **The main reason is path mapping, not build files.** rdflib's tests aren't named after the
-  modules they test (`rdflib/plugins/parsers/notation3.py` has no `test_notation3.py`), so a
-  changed source file often maps to no known test and forces the full suite: 21 of the 35 full
-  failing PR runs and 9 of the 17 full main commits.
-- **First measurement of a selective run with failures, and it's poor: 1 of 7 caught.** Five
-  of the six misses import a changed module (`rdflib/term.py`, `rdflib/store.py`), and one is a
-  recurring network test.
-- **Overall, 2,044 of 2,050 failures were caught (99.7%)**, because most failing runs fell back
-  to the full suite.
-- **With fallbacks switched off, the selector's own signals catch 1,160 of 1,954 (59%).** A
-  Python import graph is the signal for 685 of the 794 misses; 106 are tests new in the PR.
-- **`/select` is now fast:** 0.3–1.4 s, down from 79–124 s (see the next section).
+- **Final: no misses in selective runs.** All 2,050 failures in the 39 failing PR runs were
+  caught, 140 of 140 in the 17 runs that went selective, plus 1 of 1 in the main replay.
+  Round 1 (path mapping only) caught 1 of 7 in selective runs.
+- **What closed the gaps:** a static Python import graph from the CLI (including parent
+  packages, conftests and module names in strings), whole-file runs for changed or new test
+  files, doctest modules, and running changed modules under `--doctest-modules` when the repo
+  imports source modules. See [Round 2](#round-2-python-import-graph-whole-test-files-doctests).
+- **But rdflib saves almost nothing.** Its package `__init__.py` and plugin registry connect
+  nearly every module to nearly every test file, so a selective run still runs about 99% of
+  test time. Estimated time skipped across all runs fell from 10–19% (round 1, with misses)
+  to 0.2–0.6%.
+- **`/select` takes 0.3–1.4 s**, down from 79–124 s, after the history and collection-error
+  fixes below.
 
 ### Data and method
 
 - 190 CI runs (20 on main) from 2026-07-12 to 2026-10-07: 2,959 uploads (one per matrix leg),
   29.2M results, 40,145 distinct test IDs, about 18,000 of them known at any one time.
 - Same method as for kubo, with two differences:
-  - **No import graph for selection.** Python selection uses path mapping, co-change and
-    recently failed. A static import graph at each commit (`scripts/eval/pygraph.py`) is used
-    only to explain misses.
+  - **Python import graph.** In round 1, selection used path mapping, co-change and recently
+    failed, and a static import graph at each commit only explained misses. In round 2 the
+    graph is computed at each target commit and passed to the selector, as `sieve select`
+    does.
   - **History is loaded once.** The eval reads the repo's raw results into memory once (about
     100 s) and rebuilds each target's history from that. PR mode took 7.7 minutes for 49
     targets, and the main replay 2.3 minutes.
@@ -271,7 +270,7 @@ After the fix, loading history takes 0.11–0.85 s and selecting about 0.1 s. Ev
 takes 0.05 s or less; the rest is Python building 18,000 known-test entries. The "before" times
 were measured while an eval was loading the same database, so they are inflated.
 
-### PR mode
+### Round 1: PR mode (path mapping only)
 
 | | 10 most recent PR runs | 39 PR runs with failures |
 |---|---|---|
@@ -304,7 +303,7 @@ were measured while an eval was loading the same database, so they are inflated.
 | Python imports, but no graph for that test | 1 | |
 | None: looks unrelated to the change | 1 | |
 
-### Main replay (`--replay-main`, 19 main commits replayed as PRs)
+### Round 1: main replay (`--replay-main`, 19 main commits replayed as PRs)
 
 | | |
 |---|---|
@@ -316,7 +315,10 @@ were measured while an eval was loading the same database, so they are inflated.
 | **Estimated time skipped, all runs** | **9.9%** |
 | Failures | 1 in 1 run, caught by the full-suite fallback. Without fallbacks, nothing maps: `rdflib/plugins/serializers/nt.py` has no test named after it. |
 
-### Findings
+### Round 1 findings
+
+Items 1–3 are addressed in round 2.
+
 
 1. **Python needs an import graph, as Go did.** Path mapping by file name misses most of
    rdflib's dependencies. It forces the full suite for 33 of the 60 full runs here, and when it
@@ -339,6 +341,85 @@ were measured while an eval was loading the same database, so they are inflated.
    query 16× bigger than on kubo. `/select` now avoids raw results entirely. The batch rollup
    still reads the whole 90-day window: about 16 minutes and up to 15 GB of Postgres temp
    files for 29M results.
+
+### Round 2: Python import graph, whole test files, doctests
+
+**Changes**
+
+- **Python import graph.** `sieve select` builds a static import graph of the checkout with
+  `ast` (`sieve.cli.pygraph`), like `go list` for Go. It includes parent packages'
+  `__init__.py` and the `conftest.py` files pytest loads. It sends every test file that imports
+  a changed module, directly or transitively, as `affected_files`. The selector runs those
+  files whole, with the reason `imports changed module X`, and a changed module imported by a
+  known test file no longer forces the full suite. If the graph can't be built, nothing is
+  sent and the fallbacks apply.
+- **Module names in strings count as imports.** rdflib registers its parsers and serializers
+  by module path (`register("nt", Serializer, "rdflib.plugins.serializers.nt", ...)`), so the
+  first version of the graph didn't connect them to the tests that use them. A string literal
+  that is exactly the dotted name of a module in the repo is now an import edge.
+- **Changed or added test files run whole** (`pytest test/test_x.py`), so tests new in them
+  run. The CLI also sends deleted paths, so a deleted test file is never named in a command.
+- **Doctests** (`rdflib.container::rdflib.container.Container`) run as `pytest
+  --doctest-modules rdflib/container.py`. If no file can be derived, they're left out of the
+  command instead of forcing the full suite.
+- **Changed modules run under `--doctest-modules`** when history shows the repo's pytest
+  imports source modules (doctests, or collection errors in non-test modules). This catches a
+  new module that fails to import. pytest exits 5 for a module with no doctests, so that
+  command accepts exit 5; import errors (exit 2) and failing doctests still fail.
+
+**Before and after**
+
+| | Round 1 (path mapping) | Graph, first version | + module names in strings | **Final** |
+|---|---|---|---|---|
+| **39 PR runs with failures** | | | | |
+| Full / selective | 35 / 4 | 24 / 15 | 22 / 17 | **22 / 17** |
+| Failures caught | 2,044 / 2,050 | 1,991 / 2,050 | 2,037 / 2,050 | **2,050 / 2,050** |
+| **Caught in selective runs** | 1 / 7 | 58 / 117 | 127 / 140 | **140 / 140** |
+| Caught without fallbacks (full runs) | 1,160 / 1,954 | 1,873 / 1,931 | 1,864 / 1,908 | **1,880 / 1,908** |
+| Estimated time skipped, all runs | 10.2% | 5.0% | 0.2% | **0.2%** |
+| **10 most recent PR runs** | | | | |
+| Full / selective | 8 / 2 | 6 / 4 | 5 / 5 | **5 / 5** |
+| Estimated time skipped, all runs | 19.3% | 0.3% | 0.4% | **0.4%** |
+| **Main replay (19 commits)** | | | | |
+| Full / selective | 17 / 2 | 8 / 11 | 7 / 12 | **7 / 12** |
+| Failures caught (in selective runs) | 1 / 1 (by the fallback) | 1 / 1 (1 / 1) | 1 / 1 (1 / 1) | **1 / 1 (1 / 1)** |
+| Estimated time skipped, all runs | 9.9% | 25.8% | 0.6% | **0.6%** |
+
+What each step fixed:
+
+- **Round 1 → first graph:** catches the 5 import misses after `rdflib/term.py` and
+  `rdflib/store.py` changes.
+- **First graph → module names in strings:** catches the 58 failures of `string-n-serialization`
+  (round-trip, serializer and W3C N-Triples/N-Quads tests after an `nt`/`nquads` serializer
+  change), which reach the serializers only through `rdflib/plugin.py`. It also selects
+  `test_service`, the recurring network test, after a JSON-LD context change, which it reaches
+  through the same registry.
+- **→ final:** catches the 13 failures of an `owlrl` run that added the new package
+  `rdflib/plugins/inference/`, whose modules failed to import (`pytest::rdflib.plugins.inference.closure`, ...).
+
+**Remaining full-suite reasons** (8 failing PR runs, 1 recent PR run): files that no known test
+reaches. These are `.pre-commit-config.yaml`, `examples/datasets.py`, and new modules that
+nothing imports yet (`rdflib/plugins/serializers/longturtle.py`, a new `rdflib/inference/`
+package). Without fallbacks, 28 failures would be missed: all are collection errors of modules the
+run didn't change, in runs that went full anyway.
+
+**Findings**
+
+1. **0 misses in selective runs, but almost no savings on rdflib.** `rdflib/__init__.py`
+   imports most of the library, and `rdflib/plugin.py` names every plugin. So a change to
+   almost any module reaches 325 of 326 test files: selective runs skip about 1% of test
+   time. That's correct for this codebase: statically, nearly every test can reach nearly
+   every module. The 25.8% of the first graph version came from missing the plugin edges, and
+   it missed 58 failures.
+2. **File-level selection can't separate rdflib's tests.** Savings here would need a finer
+   signal, such as per-test coverage (which test executes which module), not a better import
+   graph.
+3. **The safety mechanisms are general.** Import graph with parent packages and conftests,
+   module-name strings, whole test files, doctest modules and deleted files apply to any
+   Python repo. A repo with less central `__init__` imports should see real savings; that
+   needs a second Python repo to measure.
+4. **Costs.** Building the graph takes about 5 s for rdflib's 538 files, and finding affected
+   files is instant. Eval runs: PR mode 8 minutes, main replay 2 minutes.
 
 ### Reproducing
 

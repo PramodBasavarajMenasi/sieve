@@ -129,6 +129,16 @@ class SelectRequest(BaseModel):
         max_length=20_000,
         description="Go package -> changed packages it imports, from `go list -deps -test`",
     )
+    affected_files: dict[str, list[str]] = Field(
+        default_factory=dict,
+        max_length=50_000,
+        description="Python test file -> changed modules it imports, from a static import graph",
+    )
+    deleted_files: list[Annotated[str, StringConstraints(max_length=4096)]] = Field(
+        default_factory=list,
+        max_length=50_000,
+        description="Changed files that no longer exist at head; never named in a command",
+    )
     depends: list[DependsRuleIn] = Field(default_factory=list, max_length=100)
     always_run: list[Glob] = Field(default_factory=list, max_length=1000)
     go_module: NonEmpty255 | None = None
@@ -152,6 +162,11 @@ class SelectResponse(BaseModel):
     commands: list[str]
     go_packages_run_whole: list[str] = Field(
         description="Go packages run without -run (changed, dependent or declared)"
+    )
+    python_files_run_whole: list[str] = Field(
+        default_factory=list,
+        description="Python files passed to pytest whole (changed or importing changed code, "
+        "collection errors, doctest modules)",
     )
     tests: list[SelectedTestOut] = Field(description="Selected tests; empty in full mode")
 

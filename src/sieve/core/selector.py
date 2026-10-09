@@ -27,9 +27,18 @@ Otherwise it selects the union of these signals, and every test carries its reas
     exactly when ``SelectorConfig.go_module`` is set.
   - JS/TS: ``foo.ts`` selects ``foo.test.*``, ``foo.spec.*`` and ``__tests__/foo.*``.
   - A changed test file always selects its own tests.
+  - A changed or added Python test file runs whole (``pytest path/test_x.py``), so tests new
+    in it run too. A deleted one runs nothing.
   - pytest collection errors (``pytest::a.b.c``: a module that failed to import) map to the
-    module's file ``a/b/c.py``, which pytest then runs whole. If no file can be derived, the
-    test is still selected but left out of the command rather than forcing the full suite.
+    module's file ``a/b/c.py``, which pytest then runs whole; doctests
+    (``a.b::a.b.Thing``) to ``pytest --doctest-modules a/b.py``. If no file can be derived,
+    the test is still selected but left out of the command rather than forcing the full suite.
+* **Python imports**: test files that import a changed module (``affected_files``, from the
+  CLI's static import graph) run whole.
+* **Changed modules under --doctest-modules**: when history shows the repo's pytest collects
+  source modules (doctests, or collection errors in non-test modules), changed and added
+  ``.py`` modules run with ``pytest --doctest-modules``, so an import error in a new module
+  or a broken doctest is caught.
 * **Co-change**: tests that failed in recent runs whose changed files overlap this change.
 * **Recently failed**: tests that failed in the last ``recent_main_runs`` main runs, or are
   currently broken on main.
@@ -249,6 +258,9 @@ class Selection:
     # Go packages with changed .go files. Their command has no -run filter, so tests added in
     # the same change (not yet in history) run too.
     go_packages_run_whole: tuple[str, ...] = ()
+    # Python files passed to pytest as a whole file: changed/added test files, test files that
+    # import a changed module, collection errors and doctest modules. New tests in them run too.
+    python_files_run_whole: tuple[str, ...] = ()
 
     @property
     def command(self) -> str:
@@ -265,14 +277,25 @@ def select_tests(
     changed_files_known: bool,
     config: SelectorConfig | None = None,
     affected_packages: Mapping[str, Sequence[str]] | None = None,
+    affected_files: Mapping[str, Sequence[str]] | None = None,
+    deleted_files: Iterable[str] = (),
 ) -> Selection:
     """Select tests for a change.
 
     ``affected_packages`` maps a Go package import path to the changed packages it imports
     (directly or transitively), as computed by the CLI from ``go list -deps -test``.
+    ``affected_files`` maps a Python test file to the changed modules it imports (directly,
+    transitively, via parent packages or conftest.py), from the CLI's static import graph.
+    ``deleted_files`` are changed files that no longer exist: no command names them.
     """
     config = config or SelectorConfig()
     affected_packages = affected_packages or {}
+    affected_files = {
+        path: modules
+        for file, modules in (affected_files or {}).items()
+        if (path := normalize_path(file))
+    }
+    deleted = frozenset(p for p in (normalize_path(f) for f in deleted_files) if p)
     tests = _index(history.tests.values() if history else ())
 
     def full(reason: str) -> Selection:
@@ -305,18 +328,63 @@ def select_tests(
         if reason not in reasons:
             reasons.append(reason)
 
+    # Python test files, by path: the files pytest can be pointed at whole. (Doctests and
+    # collection errors point at their module, which may be a source file.)
+    py_test_files: dict[str, list[_Test]] = {}
+    for test in tests.values():
+        if (
+            test.runner is Runner.PYTEST
+            and test.py_path
+            and not test.doctest
+            and test.classname != PYTEST_COLLECTION_CLASSNAME
+        ):
+            py_test_files.setdefault(test.py_path, []).append(test)
+
     # Path mapping. Every changed source file must map to at least one test.
     relevant = [p for p in paths if not is_ignorable(p) and p not in scoped_build]
     unmapped = []
     whole_packages: set[str] = set()
+    py_whole_files: set[str] = set()
     for path in relevant:
+        is_py_test_file = path.endswith(".py") and (
+            is_python_test_file(path) or path in py_test_files
+        )
+        if is_py_test_file and path in deleted:
+            continue  # a deleted test file: its tests are gone, there's nothing to run
         hits = _map_path(path, tests, config)
-        if not hits:
+        if is_py_test_file:
+            # Changed or added test file: run it whole, so tests new in it run too.
+            py_whole_files.add(path)
+        elif not hits:
             unmapped.append(path)
         for test_id, reason in hits.items():
             add(test_id, reason)
             if path.endswith(".go") and tests[test_id].runner is Runner.GO:
                 whole_packages.add(tests[test_id].classname)
+
+    # A repo whose history has doctests or collection errors in source modules runs pytest with
+    # --doctest-modules: pytest imports every module, so a changed or added module can fail at
+    # import (a "pytest::a.b" collection error) or in its doctests. Run those modules too.
+    py_module_files: set[str] = set()
+    if any(t.collects_source_module for t in tests.values()):
+        py_module_files = {
+            p
+            for p in relevant
+            if p.endswith(".py") and p not in deleted and p not in py_whole_files
+        }
+
+    # Python dependents: test files that import a changed module. They run whole.
+    covered_by_imports: set[str] = set()  # changed modules imported by a known test file
+    for file, modules in sorted(affected_files.items()):
+        known = py_test_files.get(file)
+        if not known or file in deleted:
+            continue
+        first = sorted(modules)[0] if modules else "?"
+        more = f" (+{len(modules) - 1} more)" if len(modules) > 1 else ""
+        for test in known:
+            add(test.test_id, f"imports changed module {first}{more}")
+        py_whole_files.add(file)
+        covered_by_imports.update(modules)
 
     # Nested manifests/lockfiles: every known test under their directory runs (Go packages
     # whole). They never force the full suite, even when no known tests live there.
@@ -353,12 +421,13 @@ def select_tests(
             if test.runner is Runner.GO:
                 whole_packages.add(test.classname)
 
-    # A changed file is covered if its own tests, its package's dependents' tests or a
-    # declared rule selected something; anything else still forces the full suite.
+    # A changed file is covered if its own tests, its package's dependents' tests, test files
+    # importing it or a declared rule selected something; anything else forces the full suite.
     unmapped = [
         p
         for p in unmapped
         if p not in covered_by_rules
+        and p not in covered_by_imports
         and not (
             p.endswith(".go")
             and any(
@@ -403,24 +472,47 @@ def select_tests(
             ):
                 add(test.test_id, f"always-run pattern {pattern!r}")
 
-    chosen = [tests[test_id] for test_id in sorted(selected)]
+    # Tests in a deleted Python file no longer exist (pytest errors on a missing path).
+    chosen = [
+        tests[test_id]
+        for test_id in sorted(selected)
+        if not (tests[test_id].runner is Runner.PYTEST and tests[test_id].py_path in deleted)
+    ]
     unrunnable = [t.test_id for t in chosen if t.runner is None]
     if unrunnable:
         return full(f"no known test runner for selected test(s): {_list(unrunnable)}")
 
+    files_run_whole = (
+        py_whole_files
+        | py_module_files
+        | {
+            node
+            for t in chosen
+            if t.runner is Runner.PYTEST and (node := t.py_node) and "::" not in node
+        }
+    )
+    if chosen:
+        summary = f"{len(chosen)} of {len(tests)} known tests selected"
+    elif py_whole_files:
+        summary = f"{len(py_whole_files)} changed test file(s) run whole, no known tests"
+    elif py_module_files:
+        summary = f"{len(py_module_files)} changed module(s) run with --doctest-modules"
+    else:
+        summary = NO_TESTS_AFFECTED
     return Selection(
         mode=Mode.SELECTIVE,
-        reason=(
-            f"{len(chosen)} of {len(tests)} known tests selected" if chosen else NO_TESTS_AFFECTED
-        ),
+        reason=summary,
         tests=tuple(
             SelectedTest(t.test_id, tuple(selected[t.test_id]), t.runner, t.file_path)
             for t in chosen
         ),
         selected_count=len(chosen),
         total_known=len(tests),
-        commands=_build_commands(chosen, config.go_module, whole_packages),
+        commands=_build_commands(
+            chosen, config.go_module, whole_packages, py_whole_files, py_module_files
+        ),
         go_packages_run_whole=tuple(sorted(whole_packages)),
+        python_files_run_whole=tuple(sorted(files_run_whole)),
     )
 
 
@@ -477,8 +569,21 @@ class _Test:
     py_path: str | None = None
     py_classes: tuple[str, ...] = ()
     # Python only: what to pass to pytest (``path::Class::test`` or a whole file). None for a
-    # collection error whose file can't be derived: it is selected but left out of commands.
+    # collection error or doctest whose file can't be derived: selected, but left out of
+    # commands.
     py_node: str | None = None
+    # A doctest (run with ``pytest --doctest-modules <file>``).
+    doctest: bool = False
+
+    @property
+    def collects_source_module(self) -> bool:
+        """A doctest, or a collection error in a non-test module: evidence that the repo's
+        pytest imports source modules (``--doctest-modules``)."""
+        if self.runner is not Runner.PYTEST or not self.py_path:
+            return False
+        return self.doctest or (
+            self.classname == PYTEST_COLLECTION_CLASSNAME and not is_python_test_file(self.py_path)
+        )
 
 
 def _index(known: Iterable[KnownTest]) -> dict[str, _Test]:
@@ -499,6 +604,11 @@ def _classify(test: KnownTest) -> _Test:
     if classname == PYTEST_COLLECTION_CLASSNAME:
         module = _collection_error_path(name, file_path)
         return _Test(test.test_id, classname, name, file_path, Runner.PYTEST, module, (), module)
+    if _is_doctest(classname, name, ext):
+        module = _collection_error_path(classname, file_path)
+        return _Test(
+            test.test_id, classname, name, file_path, Runner.PYTEST, module, (), module, True
+        )
 
     python = _python_location(classname, file_path)
     if ext == ".go" or (not ext and _looks_like_go(classname, name)):
@@ -517,8 +627,30 @@ def _classify(test: KnownTest) -> _Test:
     return _Test(test.test_id, classname, name, file_path, runner)
 
 
+def _is_doctest(classname: str, name: str, ext: str) -> bool:
+    """pytest ``--doctest-modules`` items: the classname is the module (``rdflib.container``)
+    and the name is the documented object's dotted path inside it
+    (``rdflib.container.Container``), or the module itself for its module docstring."""
+    if not classname or ext not in ("", ".py") or any(c.isspace() or c == "/" for c in classname):
+        return False
+    return name.startswith(classname + ".") or (name == classname and "." in classname)
+
+
+def is_python_test_file(path: str) -> bool:
+    """pytest's default ``python_files``: ``test_*.py`` or ``*_test.py``."""
+    base = posixpath.basename(path)
+    return base.endswith(".py") and (base.startswith("test_") or base.endswith("_test.py"))
+
+
+def pytest_file(test_id: str, file_path: str | None = None) -> str | None:
+    """The file pytest runs ``test_id`` from (test module, doctest module or the module of a
+    collection error), or None if it isn't a pytest test or no file can be derived."""
+    test = _classify(KnownTest(test_id, file_path))
+    return test.py_path if test.runner is Runner.PYTEST else None
+
+
 def _collection_error_path(module: str, file_path: str | None) -> str | None:
-    """The file of a pytest collection error: ``a.b.c`` -> ``a/b/c.py`` (or its file_path).
+    """The file of a dotted module name: ``a.b.c`` -> ``a/b/c.py`` (or its file_path).
 
     None if the name isn't a dotted module name, so no file can be derived.
     """
@@ -649,23 +781,37 @@ def _build_commands(
     tests: Sequence[_Test],
     go_module: str | None = None,
     go_whole_packages: Collection[str] = (),
+    py_whole_files: Collection[str] = (),
+    py_module_files: Collection[str] = (),
 ) -> tuple[str, ...]:
     """One command per runner (per package for Go), in a stable order.
 
     Go packages in ``go_whole_packages`` run without -run, so tests that history doesn't
     know yet (added in this change) run too. Other Go packages only had tests pulled in by
     co-change, recently-failed or always-run, so they keep -run for just those tests.
+    Python files in ``py_whole_files`` are likewise passed to pytest whole.
     """
     commands: list[str] = []
 
-    nodes = {t.py_node for t in tests if t.runner is Runner.PYTEST and t.py_node}
-    # A whole file (a collection error) already runs every test in it.
+    nodes = {t.py_node for t in tests if t.runner is Runner.PYTEST and t.py_node and not t.doctest}
+    nodes.update(py_whole_files)
+    # A whole file (changed, imports a changed module, or a collection error) already runs
+    # every test in it.
     whole_files = {node for node in nodes if "::" not in node}
     pytest_ids = sorted(
         node for node in nodes if "::" not in node or node.partition("::")[0] not in whole_files
     )
     if pytest_ids:
         commands.append(shlex.join(["pytest", *pytest_ids]))
+    known_doctest_files = {t.py_node for t in tests if t.doctest and t.py_node}
+    doctest_files = sorted(known_doctest_files | set(py_module_files))
+    if doctest_files:
+        command = shlex.join(["pytest", "--doctest-modules", *doctest_files])
+        if set(doctest_files) - known_doctest_files:
+            # A module may have no doctests: pytest then exits 5 ("no tests collected"),
+            # which isn't a failure. Import errors (exit 2) and doctest failures (1) still are.
+            command = f"{{ {command} || test $? -eq 5; }}"
+        commands.append(command)
 
     # Go: -run matches top-level tests; subtests run as part of their parent.
     go_tests: dict[str, set[str]] = {}

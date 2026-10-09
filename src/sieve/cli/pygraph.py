@@ -1,22 +1,30 @@
-"""Static Python import graph of a checkout, for explaining eval misses.
+"""Static Python import graph of a checkout, for selecting tests that import changed code.
 
-Used only by ``run_eval.py`` to answer "would a Python import graph have selected this
-failing test?". The selector does not use it.
+``sieve select`` builds it at the repo root (like ``go list`` for Go) and sends
+``PyGraph.affected(changed_files)`` as ``affected_files``: every test file that imports a
+changed module, directly or transitively. The eval also uses it to explain misses.
 
 Edges are file -> files it imports (repo-relative paths). ``import a.b.c`` also loads ``a`` and
 ``a.b``, so those packages' ``__init__.py`` files are edges too. A test file is also treated
 as importing every ``conftest.py`` in its directory and above, since pytest loads them.
+Imports are read statically with ``ast``. A string literal that is exactly the dotted name of
+a module in the repo (``"pkg.plugins.json"``) also counts as importing it, since plugin
+registries and ``importlib.import_module`` load modules by name. Other dynamic imports (names
+built at runtime, entry points) are invisible; the selector's other signals and fallbacks
+still apply.
 """
 
 from __future__ import annotations
 
 import ast
 import posixpath
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from sieve.core.selector import is_python_test_file
 
 SKIP_DIRS = frozenset(
     {".git", ".venv", "venv", ".tox", ".nox", "build", "dist", "node_modules", ".eggs",
@@ -47,6 +55,37 @@ class PyGraph:
                     parent[nxt] = current
                     queue.append(nxt)
         return None
+
+    def affected(self, changed_files: Iterable[str]) -> dict[str, list[str]]:
+        """Test file -> the changed modules it imports (itself excluded), for every test file
+        that imports one: directly, transitively, through a parent package's ``__init__.py``
+        or through a ``conftest.py`` pytest loads for it."""
+        importers: dict[str, set[str]] = defaultdict(set)
+        for file, imports in self.edges.items():
+            for imported in imports:
+                importers[imported].add(file)
+        reached_by: dict[str, set[str]] = defaultdict(set)  # file -> changed modules it reaches
+        for changed in sorted({p for p in changed_files if p in self.edges}):
+            seen = {changed}
+            queue = deque(seen)
+            while queue:
+                for importer in importers.get(queue.popleft(), ()):
+                    if importer not in seen:
+                        seen.add(importer)
+                        queue.append(importer)
+            for file in seen:
+                reached_by[file].add(changed)
+        affected = {}
+        for file in sorted(self.edges):
+            if not is_python_test_file(file):
+                continue
+            modules = set(reached_by.get(file, ()))
+            for conftest in conftests_for(file, self.edges):
+                modules |= reached_by.get(conftest, set())
+            modules.discard(file)
+            if modules:
+                affected[file] = sorted(modules)
+        return affected
 
     def to_json(self) -> dict[str, Any]:
         return {"edges": {f: sorted(e) for f, e in self.edges.items()}}
@@ -94,8 +133,8 @@ def build_py_graph(root: Path) -> PyGraph:
     for file in files:
         try:
             tree = ast.parse((root / file).read_bytes(), filename=file)
-        except (SyntaxError, ValueError):
-            edges[file] = frozenset()
+        except (SyntaxError, ValueError, RecursionError, OSError):
+            edges[file] = frozenset()  # unreadable or unparsable: no edges
             continue
         targets: set[str] = set()
         package = _package_of(file)
@@ -112,6 +151,15 @@ def build_py_graph(root: Path) -> PyGraph:
                     if alias.name != "*":
                         targets.update(_resolve(f"{base}.{alias.name}" if base else alias.name,
                                                 modules, ancestors=False))  # fmt: skip
+            elif (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and "." in node.value
+                and node.value in modules
+            ):
+                # A dotted module name in a string: a plugin registry or importlib call
+                # loads it at runtime (rdflib registers its parsers/serializers this way).
+                targets.add(modules[node.value])
         targets.discard(file)
         edges[file] = frozenset(targets)
     return PyGraph(edges)

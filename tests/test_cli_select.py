@@ -9,7 +9,7 @@ import pytest
 import respx
 from typer.testing import CliRunner, Result
 
-from sieve.cli.main import app, parse_name_status
+from sieve.cli.main import app, parse_deleted, parse_name_status
 from tests.gofixture import M, go_list_packages
 
 SERVER = "http://sieve.test"
@@ -115,6 +115,10 @@ def test_prints_command_for_branch_diff(api: respx.MockRouter) -> None:
         # No .sieve.toml and no go.mod: empty rules, no go_module or affected_packages.
         "depends": [],
         "always_run": [],
+        # The deleted file and the old side of the rename: never named in a command.
+        "deleted_files": ["src/gone.py", "src/old_name.py"],
+        # Python files changed, so the import graph ran; no test file imports them.
+        "affected_files": {},
     }
 
 
@@ -391,3 +395,93 @@ def test_parse_name_status() -> None:
 
 def test_parse_empty_diff() -> None:
     assert parse_name_status(b"") == []
+
+
+def test_parse_deleted() -> None:
+    output = b"M\0a.py\0D\0gone.py\0R090\0old.py\0new.py\0C100\0t.py\0copy.py\0A\0n.py\0"
+    assert parse_deleted(output) == ["gone.py", "old.py"]
+    assert parse_deleted(b"") == []
+
+
+# --- Python import graph ------------------------------------------------------------------
+
+
+@pytest.fixture
+def py_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """shop/money.py changes; tests/test_cart.py imports it through shop/cart.py."""
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.email", "t@example.com")
+    git(tmp_path, "config", "user.name", "Test")
+    git(tmp_path, "config", "commit.gpgsign", "false")
+    files = {
+        "shop/__init__.py": "",
+        "shop/money.py": "RATE = 1\n",
+        "shop/cart.py": "from shop.money import RATE\n",
+        "shop/tax.py": "",
+        "tests/test_cart.py": "from shop import cart\n",
+        "tests/test_tax.py": "import shop.tax\n",
+    }
+    for name, content in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(content)
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "base")
+    git(tmp_path, "checkout", "-q", "-b", "feature")
+    (tmp_path / "shop" / "money.py").write_text("RATE = 2\n")
+    git(tmp_path, "commit", "-q", "-am", "change money")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+@pytest.mark.usefixtures("py_repo")
+def test_python_importers_are_sent(api: respx.MockRouter) -> None:
+    route = api.post(SELECT_URL).respond(json=response())
+
+    result = run()
+
+    assert result.exit_code == 0, result.output
+    assert sent(route)["affected_files"] == {"tests/test_cart.py": ["shop/money.py"]}
+    assert "deleted_files" not in sent(route)
+    assert "python imports: 1 test file(s) import changed modules" in result.stderr
+
+
+@pytest.mark.usefixtures("py_repo")
+def test_python_graph_failure_sends_no_importers(
+    api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(root: Path) -> None:
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr("sieve.cli.main.build_py_graph", broken)
+    route = api.post(SELECT_URL).respond(json=response())
+
+    result = run()
+
+    assert result.exit_code == 0
+    assert sent(route)["affected_files"] == {}  # existing fallbacks decide
+    assert "could not build the Python import graph (disk on fire)" in result.stderr
+
+
+@pytest.mark.usefixtures("py_repo")
+def test_no_py_imports_option(api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sieve.cli.main.build_py_graph", lambda root: pytest.fail("built graph"))
+    route = api.post(SELECT_URL).respond(json=response())
+
+    run("--no-py-imports")
+
+    assert "affected_files" not in sent(route)
+
+
+def test_python_graph_skipped_without_python_changes(
+    py_repo: Path, api: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sieve.cli.main.build_py_graph", lambda root: pytest.fail("built graph"))
+    route = api.post(SELECT_URL).respond(json=response())
+    (py_repo / "README.md").write_text("docs\n")
+    git(py_repo, "add", "-A")
+    git(py_repo, "commit", "-q", "-m", "docs")
+
+    run("--base", "HEAD~1")
+
+    assert sent(route)["changed_files"] == ["README.md"]
+    assert "affected_files" not in sent(route)

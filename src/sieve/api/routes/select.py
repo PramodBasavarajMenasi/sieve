@@ -31,6 +31,8 @@ def post_select(
         body.changed_files_known,
         config,
         affected_packages=body.affected_packages,
+        affected_files=body.affected_files,
+        deleted_files=body.deleted_files,
     )
     return SelectResponse(
         repo=body.repo,
@@ -41,6 +43,7 @@ def post_select(
         command=selection.command,
         commands=list(selection.commands),
         go_packages_run_whole=list(selection.go_packages_run_whole),
+        python_files_run_whole=list(selection.python_files_run_whole),
         tests=[
             SelectedTestOut(
                 test_id=t.test_id,

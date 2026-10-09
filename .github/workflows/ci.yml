@@ -23,7 +23,9 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        # The official Docker image, pulled from AWS's public mirror: anonymous pulls from
+        # Docker Hub on shared GitHub runners hit its rate limit ("toomanyrequests").
+        image: public.ecr.aws/docker/library/postgres:16-alpine
         env:
           POSTGRES_USER: sieve
           POSTGRES_PASSWORD: sieve

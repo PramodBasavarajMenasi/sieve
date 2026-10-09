@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/PramodBasavarajMenasi/sieve/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/PramodBasavarajMenasi/sieve/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/PramodBasavarajMenasi/sieve/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/PramodBasavarajMenasi/sieve/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue">
   <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange">

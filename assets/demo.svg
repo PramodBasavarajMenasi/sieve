@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="214" viewBox="0 0 900 214" role="img" aria-labelledby="title desc">
+  <title id="title">sieve select on RDFLib/rdflib</title>
+  <desc id="desc">A terminal running sieve select on an rdflib commit that changed rdflib/graph.py and test/test_dataset/test_dataset.py. The Python import graph finds 325 test files that import changed modules, sieve selects 11448 of 11516 known tests, and prints a pytest command.</desc>
+  <rect width="900" height="214" rx="10" fill="#0d1117"/>
+  <rect x="0.5" y="0.5" width="899" height="213" rx="9.5" fill="none" stroke="#30363d"/>
+  <circle cx="22" cy="20" r="6" fill="#ff5f57"/>
+  <circle cx="42" cy="20" r="6" fill="#febc2e"/>
+  <circle cx="62" cy="20" r="6" fill="#28c840"/>
+  <text x="450" y="24" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" text-anchor="middle">rdflib — bash</text>
+  <line x1="0" y1="40" x2="900" y2="40" stroke="#30363d"/>
+  <g font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" xml:space="preserve">
+    <text x="20" y="70" fill="#8b949e"># commit d165439 changed rdflib/graph.py and test/test_dataset/test_dataset.py</text>
+    <text x="20" y="96"><tspan fill="#3fb950">$</tspan><tspan fill="#e6edf3"> sieve select --repo RDFLib/rdflib --base HEAD~1</tspan></text>
+    <text x="20" y="122" fill="#8b949e">sieve: python imports: 325 test file(s) import changed modules</text>
+    <text x="20" y="148"><tspan fill="#8b949e">sieve: </tspan><tspan fill="#2dd4bf">selective</tspan><tspan fill="#8b949e"> (11448 of 11516 known tests): 11448 of 11516 known tests selected</tspan></text>
+    <text x="20" y="174" fill="#e6edf3">pytest test/data/suites/trix/test_trix.py test/jsonld/test_api.py test/jsonld/test_compaction.py …</text>
+    <text x="20" y="198"><tspan fill="#3fb950">$</tspan><tspan fill="#e6edf3"> </tspan><tspan fill="#e6edf3" opacity="0.8">▍</tspan></text>
+  </g>
+</svg>
